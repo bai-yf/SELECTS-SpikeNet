@@ -9,14 +9,14 @@ An integrated clinical software system for end-to-end automatic spike detection 
 
 https://docs/screenshot.png
 
-markdown
+🚀 Quick Start
+1. Environment Setup
+Option A: Using Conda (Recommended)
 ```bash
-# 创建虚拟环境
-python -m venv eeg_env
+# Create conda environment
+conda create -n selects-spikenet python=3.9
+conda activate selects-spikenet
 
-# 激活环境（Linux/Mac）
-source eeg_env/bin/activate
-
-# 安装依赖
+# Install core dependencies
 pip install -r requirements.txt
 ```
