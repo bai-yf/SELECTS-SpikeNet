@@ -1,17 +1,11 @@
-# SELECTS-SpikeNet
+SELECTS-SpikeNet
 《A Clinical Software for End-to-End Automatic Spike Detection in SeLECTS from Long-Term EEG Based on Multi-Domain Feature Fusion》
 
-#📋 Project Overview
-An integrated system for EEG data acquisition, processing, visualization, and model fine-tuning. Supports real-time EEG signal collection, filtering, spike detection, SWI calculation, and machine learning model training.
+https://img.shields.io/badge/Python-3.9%252B-blue.svg
+https://img.shields.io/badge/GUI-PyQt5-green.svg
+https://img.shields.io/badge/Integration-MATLAB-orange.svg
+https://img.shields.io/badge/Toolbox-EEGLAB-yellow.svg
 
-#🚀 Quick Start
-Step 1: Environment Setup
-1. Create Virtual Environment
-   
-Linux/Mac
-python3 -m venv eeg_env
-source eeg_env/bin/activate
+An integrated clinical software system for end-to-end automatic spike detection in Self-Limited Epilepsy with Centrotemporal Spikes (SeLECTS) from long-term EEG recordings. The system combines signal processing, machine learning, and interactive visualization for comprehensive EEG analysis.
 
-If using conda
-conda create -n eeg_env python=3.9
-conda activate eeg_env
+https://docs/screenshot.png
