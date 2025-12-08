@@ -58,6 +58,8 @@ savepath;
 
 4. Model Weights
 Fold_3_best_weights.pth is the pretrained model weight file; alternatively, you can use the code in the model documents to train the model on your own.
+
+5.the Kolmogorov-Arnold Network (KAN)  from the efficient-kan repository.（reference:https://github.com/Blealtan/efficient-kan）
 ```text
 SELECTS-SpikeNet/
 ├── main.py                      # Main application entry point
@@ -83,20 +85,67 @@ SELECTS-SpikeNet/
 ```
 
 
+🧠 Model Architecture
+Hybrid KAN+ResNet Model
+```text
+Input (16 channels × 200ms window)
+    │
+    ▼
+[Feature Extraction]
+    ├── Temporal derivatives (x0, x1, x2)
+    ├── SNE (Spike Nonlinear Energy) features
+    └── Multi-channel fusion
+    │
+    ▼
+[LightResNet-EEG Backbone]
+    ├── Conv2D + BatchNorm
+    ├── BasicBlock × 4 layers
+    ├── Spatial Pyramid Pooling
+    └── 128-dim feature vector
+    │
+    ▼
+[KAN Classifier]
+    ├── Kolmogorov-Arnold Network layers
+    ├── 128 → 64 → 2 architecture
+    └── Probability output
+    │
+    ▼
+Output: Spike (1) / Non-spike (0) with confidence
+```
+
+🛠️ Development
+Building from Source
+```bash
+# Clone repository
+git clone https://github.com/yourusername/SELECTS-SpikeNet.git
+cd SELECTS-SpikeNet
+
+# Install in development mode
+pip install -e .
+
+# Run tests
+python main.py/
+```
+
+📝 Citation
+If you use this software in your research, please cite:
+```bibtex
+@software{selects_spikenet_2024,
+  title = {SELECTS-SpikeNet: A Clinical Software for End-to-End Automatic Spike Detection in SeLECTS},
+  author = {Your Name and Collaborators},
+  year = {2024},
+  url = {https://github.com/yourusername/SELECTS-SpikeNet}
+}
+```
 
 
 
 
 
 
+```text
 
-
-
-
-
-
-
-
+```
 
 
 
