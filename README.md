@@ -8,3 +8,15 @@ SELECTS-SpikeNet
 An integrated clinical software system for end-to-end automatic spike detection in Self-Limited Epilepsy with Centrotemporal Spikes (SeLECTS) from long-term EEG recordings. The system combines signal processing, machine learning, and interactive visualization for comprehensive EEG analysis.
 
 https://docs/screenshot.png
+
+markdown
+```bash
+# 创建虚拟环境
+python -m venv eeg_env
+
+# 激活环境（Linux/Mac）
+source eeg_env/bin/activate
+
+# 安装依赖
+pip install -r requirements.txt
+```
