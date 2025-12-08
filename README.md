@@ -20,3 +20,86 @@ conda activate selects-spikenet
 # Install core dependencies
 pip install -r requirements.txt
 ```
+Option B: Using Virtual Environment
+```bash
+# Create virtual environment
+python -m venv eeg_env
+
+# Activate on Windows
+eeg_env\Scripts\activate
+
+# Activate on Linux/Mac
+source eeg_env/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+2. MATLAB Engine Installation
+```bash
+# Navigate to MATLAB engine directory
+cd "C:\Program Files\MATLAB\R2024a\extern\engines\python"
+
+# Install MATLAB engine for Python
+python setup.py install
+
+# Alternative: Install from pip (if available)
+pip install matlabengine
+```
+
+3. EEGLAB Setup
+Download EEGLAB from https://sccn.ucsd.edu/eeglab/download.php
+Extract to: D:\MATLAB\R2024a\toolbox\eeglab (or your preferred path)
+Add to MATLAB path:
+```bash
+addpath(genpath('D:\MATLAB\R2024a\toolbox\eeglab'));
+savepath;
+```
+
+4. Model Weights
+Fold_3_best_weights.pth is the pretrained model weight file; alternatively, you can use the code in the model documents to train the model on your own.
+```text
+SELECTS-SpikeNet/
+├── main.py                      # Main application entry point
+├── requirements.txt             # Python dependencies
+├── README.md                    # This file
+├── models/                      # Model architecture and weights
+│   ├── __init__.py
+│   ├── kan_resnet_model.py     # KAN+ResNet hybrid model
+│   └── weights/
+│       └── fold_3_best_weights.pth  # Pretrained model
+├── data/                        # Data directories
+│   ├── txt/                    # Raw TXT format EEG data
+│   ├── set/                    # SET format EEG data
+│   ├── filtered/               # Preprocessed SET files
+│   ├── sleep_csv/              # Sleep staging CSV files
+│   ├── temp_set/               # Temporary SET files
+│   └── result/                 # Spike detection results
+├── docs/                        # Documentation and screenshots
+└── utils/                       # Utility functions
+    ├── preprocessing.py        # MATLAB preprocessing functions
+    ├── feature_extraction.py   # Multi-domain feature extraction
+    └── visualization.py        # Plotting and visualization utilities
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```bash
+
+```
