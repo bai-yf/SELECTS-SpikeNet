@@ -1,0 +1,12 @@
+# Python 缓存文件
+__pycache__/
+*.pyc
+*.pyo
+# 日志文件
+*.log
+# 虚拟环境
+venv/
+env/
+# IDE 配置文件
+.vscode/
+.idea/

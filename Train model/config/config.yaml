@@ -1,0 +1,29 @@
+# Data path configuration
+data:
+  raw_data_dir: "data/raw"                     # Raw EEG data path
+  metadata_path: "data/metadata/spick_time_label.xlsx"  # Metadata file path
+  results_dir: "results"                       # Results save path
+
+# Signal processing parameters
+signal:
+  sampling_freq: 500                           # Sampling frequency
+  window_sec: 0.2                              # Window length (seconds)
+  pre_post_time: 0.1                           # Label time tolerance (seconds)
+  n_channels: 16                               # Number of channels
+
+# Training parameters
+training:
+  batch_size: 64
+  epochs: 30
+  learning_rate: 1e-4
+  patience: 5                                  # Early stopping patience
+  seed: 42                                     # Random seed
+
+# Model parameters
+model:
+  resnet_dropout: 0.3
+  spp_output_sizes: [1, 2, 4]                  # SPP output sizes
+  kan_layers: [128, 64]                        # KAN hidden layers
+
+# Device configuration
+device: "cuda:0"                               # Options: "cpu" or "cuda:0", "cuda:1"
