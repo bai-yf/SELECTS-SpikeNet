@@ -1,4 +1,3 @@
-SELECTS-SpikeNet
 《A Clinical Software for End-to-End Automatic Spike Detection in SeLECTS from Long-Term EEG Based on Multi-Domain Feature Fusion》
 
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/)
