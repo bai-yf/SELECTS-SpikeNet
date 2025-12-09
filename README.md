@@ -7,7 +7,7 @@ SELECTS-SpikeNet
 [![EEGLAB](https://img.shields.io/badge/Toolbox-EEGLAB-yellow.svg)](https://sccn.ucsd.edu/eeglab/)
 An integrated clinical software system for end-to-end automatic spike detection in Self-Limited Epilepsy with Centrotemporal Spikes (SeLECTS) from long-term EEG recordings. The system combines signal processing, machine learning, and interactive visualization for comprehensive EEG analysis.
 
-https://docs/screenshot.png
+[https://docs/screenshot.png](https://github.com/bai-yf/SELECTS-SpikeNet/blob/master/interface/interface.png)
 
 🚀 Quick Start
 1. Environment Setup
