@@ -59,29 +59,87 @@ savepath;
 4. Model Weights
 Fold_3_best_weights.pth is the pretrained model weight file; alternatively, you can use the code in the model documents to train the model on your own.
 
-5.the Kolmogorov-Arnold Network (KAN)  from the efficient-kan repository.（reference:https://github.com/Blealtan/efficient-kan）
+5.Run the Interface
+Note: The interface runs locally.
+Navigate to the target directory via your local command line:
+```bash
+cd SELECTS-SpikeNet/interface/code
+```
+Launch the interface with the following command:
+```bash
+python main.py
+```
+
+6.Model training is executed on a GPU-equipped server.
+6.the Kolmogorov-Arnold Network (KAN)  from the efficient-kan repository.（reference:https://github.com/Blealtan/efficient-kan）
+
+
+📁 File Directory Structure
 ```text
 SELECTS-SpikeNet/
-├── main.py                      # Main application entry point
-├── requirements.txt             # Python dependencies
-├── README.md                    # This file
-├── models/                      # Model architecture and weights
-│   ├── __init__.py
-│   ├── kan_resnet_model.py     # KAN+ResNet hybrid model
-│   └── weights/
-│       └── fold_3_best_weights.pth  # Pretrained model
-├── data/                        # Data directories
-│   ├── txt/                    # Raw TXT format EEG data
-│   ├── set/                    # SET format EEG data
-│   ├── filtered/               # Preprocessed SET files
-│   ├── sleep_csv/              # Sleep staging CSV files
-│   ├── temp_set/               # Temporary SET files
-│   └── result/                 # Spike detection results
-├── docs/                        # Documentation and screenshots
-└── utils/                       # Utility functions
-    ├── preprocessing.py        # MATLAB preprocessing functions
-    ├── feature_extraction.py   # Multi-domain feature extraction
-    └── visualization.py        # Plotting and visualization utilities
+├── interface/                          # GUI application (for users)
+│   └── code/
+│       ├── main.py                     # Main GUI application entry
+│       ├── config.py                   # GUI configuration settings
+│       ├── requirements.txt            # GUI dependencies
+│       ├── fold_3_best_weights.pth     # Pre-trained model for inference
+│       ├── efficient-kan/              # KAN implementation
+│       ├── core/                       # Core processing modules
+│       │   ├── __init__.py
+│       │   ├── models.py              # Model loading and inference
+│       │   ├── features.py            # Feature extraction for inference
+│       │   ├── preprocessing.py       # Real-time EEG preprocessing
+│       │   └── metrics.py             # Real-time metrics calculation
+│       ├── ui/                         # User interface components
+│       │   ├── __init__.py
+│       │   └── dialogs.py             # GUI dialog windows
+│       ├── visualization/              # Result visualization
+│       │   ├── __init__.py
+│       │   └── brain_topography.py    # Brain map plotting
+│       ├── utils/                      # GUI utilities
+│       │   ├── __init__.py
+│       │   └── file_io.py             # File handling for GUI
+│   └── data/                          # GUI application data directory
+│       ├── txt/                       # Raw TXT EEG files
+│       ├── set/                       # SET format EEG files
+│       ├── filtered/                  # Filtered/preprocessed SET files
+│       ├── sleep_csv/                 # Sleep stage annotation files
+│       ├── temp_set/                  # Temporary processing files
+│       └── result/                    # Detection results
+│
+└── Train model/                       # Training code (for developers/researchers)
+    ├── README.md                      # Training instructions
+    ├── requirements.txt               # Training dependencies
+    ├── config/                        # Training configuration
+    │   └── config.yaml                # YAML config file
+    ├── data/                          # Training data
+    │   ├── raw/                       # Raw training EEG data
+    │   │   ├── subject1.set
+    │   │   ├── subject2.set
+    │   │   └── ...
+    │   └── metadata/                  # Training labels
+    │       └── spick_time_label.xlsx  # Column1: patient ID, Column2+: spike times
+    ├── src/                           # Training source code
+    │   ├── __init__.py
+    │   ├── data_loader.py             # Data loading and preprocessing
+    │   ├── models/                    # Model definitions
+    │   │   ├── __init__.py
+    │   │   ├── light_resnet.py       # ResNet backbone
+    │   │   ├── kan_classifier.py     # KAN classifier
+    │   │   └── fusion_model.py       # Combined model
+    │   ├── utils/                     # Training utilities
+    │   │   ├── __init__.py
+    │   │   ├── preprocessing.py      # Training preprocessing
+    │   │   ├── augmentation.py       # Data augmentation
+    │   │   └── metrics.py            # Training metrics
+    │   └── train.py                   # Main training script
+    └── results/                       # Training outputs
+        ├── fold_1_best_weights.pth   # Cross-validation model 1
+        ├── fold_2_best_weights.pth   # Cross-validation model 2
+        ├── fold_3_best_weights.pth   # Cross-validation model 3
+        ├── ...                        # Additional folds
+        └── training_logs.csv         # Training logs
+ 
 ```
 
 
