@@ -1,75 +1,1494 @@
-# main.py
+# -*- coding: utf-8 -*-
+# Synchronized from the final V9 long-term EEG interface.
+# Run with run_V9_interface.bat to keep the console open for error messages.
+
 import sys
 import os
+import re
+import io
 import numpy as np
+import pandas as pd
 import mne
-import torch
-import torch.nn.functional as F
-
-# PyQt5 imports
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                            QHBoxLayout, QPushButton, QLabel, QScrollArea, 
-                            QSlider, QMessageBox, QProgressDialog)
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QFont
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                            QHBoxLayout, QPushButton, QLabel, QFileDialog,
+                            QScrollArea, QMessageBox, QProgressDialog, QSlider,
+                            QDialog, QDialogButtonBox,QSpinBox,QTimeEdit,QMenu)
+from PyQt5.QtCore import Qt,QTime,QEvent
 import pyqtgraph as pg
-from pyqtgraph import PlotWidget, TextItem, LinearRegionItem
+from pyqtgraph import PlotWidget, LinearRegionItem
+from PyQt5.QtGui import QFont
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+import matplotlib.pyplot as plt
+import time
+import matlab.engine
+import traceback
+import subprocess
+import json
+import concurrent.futures
+import threading
 
-# Import from our modular components
-from core.models import FusionModel
-from core.features import extract_multi_channel_features
-from core.preprocessing import call_matlab_preprocess
-from core.metrics import calculate_swi, calculate_high_pred1_ratios
-from ui.dialogs import (SpikeConfirmDialog, TimeRowRangeDialog, 
-                       SleepStageImportDialog)
-from visualization.brain_topography import plot_brain_topography, plot_electrode_montage
-from utils.file_io import save_spike_data, load_spike_data
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+INTERFACE_DATA_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "data"))
+EFFICIENT_KAN_PATH = os.path.join(SCRIPT_DIR, "efficient-kan", "src")
+MODEL_WEIGHT_PATH = os.path.join(SCRIPT_DIR, "fold_3_best_weights.pth")
+REVIEW_DIR = os.path.dirname(SCRIPT_DIR)
+LONG_TERM_RECORD_CSV = os.path.join(REVIEW_DIR, "长程数据标注记录.csv")
+AUTO_RESULT_DIR = os.path.join(SCRIPT_DIR, "results")
+MANUAL_CORRECTION_RESULT_DIR = os.path.join(SCRIPT_DIR, "manual_correction_results")
+AUTOSAVE_LABEL_DIR = os.path.join(SCRIPT_DIR, "autosave_spike_labels")
+MANUAL_SLEEP_STAGE_GUI = os.path.join(SCRIPT_DIR, "manual_sleep_stage_label_gui.py")
+MANUAL_SLEEP_LABEL_DIR = os.path.join(SCRIPT_DIR, "manual_sleep_stage_labels")
+os.makedirs(MANUAL_SLEEP_LABEL_DIR, exist_ok=True)
+os.makedirs(AUTO_RESULT_DIR, exist_ok=True)
+os.makedirs(MANUAL_CORRECTION_RESULT_DIR, exist_ok=True)
+os.makedirs(AUTOSAVE_LABEL_DIR, exist_ok=True)
 
+LONG_TERM_RECORD_COLUMNS = [
+    "编号", "对应原始数据", "总记录时长", "可分析时长", "被排除时长",
+    "棘波检测用时", "棘波检测结果", "手动修改核对用时", "手动修改棘波检测结果",
+    "人工标注棘波用时", "人工标注棘波结果"
+]
+
+# 模型相关依赖与结构（保持不变）
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models.resnet import BasicBlock
+
+if EFFICIENT_KAN_PATH not in sys.path:
+    sys.path.append(EFFICIENT_KAN_PATH)
+from efficient_kan.kan import KAN
+
+# 模型结构（保持不变）
+class SpatialPyramidPooling(nn.Module):
+    def __init__(self, output_sizes=[1, 2, 4]):
+        super().__init__()
+        self.pool_layers = nn.ModuleList([
+            nn.AdaptiveAvgPool2d((size, size*2)) for size in output_sizes
+        ])
+
+    def forward(self, x):
+        all_features = []
+        for pool in self.pool_layers:
+            pooled = pool(x)
+            all_features.append(pooled.view(pooled.size(0), -1))
+        return torch.cat(all_features, dim=1)
+
+class LightResNet18_EEG(nn.Module):
+    def __init__(self, num_channels, time_steps, dropout_rate=0.3, spp_output_sizes=[1,2,4]):
+        super().__init__()
+        self.inplanes = 16
+        self.in_channels = 4
+
+        self.conv1 = nn.Conv2d(
+            in_channels=self.in_channels,
+            out_channels=self.inplanes,
+            kernel_size=(3, 5),
+            stride=(1, 2),
+            padding=(1, 2),
+            bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(self.inplanes)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(
+            kernel_size=(1, 3),
+            stride=(1, 2),
+            padding=(0, 1)
+        )
+
+        self.layer1 = self._make_layer(BasicBlock, 32, 3, stride=1)
+        self.layer2 = self._make_layer(BasicBlock, 64, 4, stride=(1, 2))
+        self.layer3 = self._make_layer(BasicBlock, 128, 6, stride=(1, 2))
+        self.layer4 = self._make_layer(BasicBlock, 128, 3, stride=1)
+
+        self.spp = SpatialPyramidPooling(output_sizes=spp_output_sizes)
+
+        with torch.no_grad():
+            dummy = torch.randn(1, self.in_channels, num_channels, time_steps)
+            out = self.conv1(dummy)
+            out = self.bn1(out)
+            out = self.relu(out)
+            out = self.maxpool(out)
+            out = self.layer1(out)
+            out = self.layer2(out)
+            out = self.layer3(out)
+            out = self.layer4(out)
+            self.feature_dim = self.spp(out).size(1)
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+
+        layers = [block(self.inplanes, planes, stride, downsample)]
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x, return_spp_input=False):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        spp_input_flat = x.view(x.size(0), -1)
+        x = self.spp(x)
+
+        if return_spp_input:
+            return x, spp_input_flat
+        return x
+
+class KANClassifier(nn.Module):
+    def __init__(self, feature_dim, num_classes):
+        super().__init__()
+        self.kan = KAN([feature_dim, 128, 64, num_classes])
+
+    def forward(self, x):
+        return self.kan(x)
+
+class FusionModel(nn.Module):
+    def __init__(self, num_channels, time_steps, num_classes=2, dropout_rate=0.3):
+        super().__init__()
+        self.resnet_extractor = LightResNet18_EEG(
+            num_channels=num_channels,
+            time_steps=time_steps,
+            dropout_rate=dropout_rate
+        )
+        self.classifier = KANClassifier(
+            self.resnet_extractor.feature_dim,
+            num_classes=num_classes
+        )
+
+    def forward(self, X):
+        feat = self.resnet_extractor(X)
+        return self.classifier(feat)
+
+INFERENCE_BATCH_SIZE = 256
+CPU_INFERENCE_BATCH_SIZE = 64
+
+# 特征提取函数（保持不变）
+def extract_sne_features(signal_1d):
+    from scipy.signal import convolve
+    neo = signal_1d ** 2 - np.roll(signal_1d, 1) * np.roll(signal_1d, -1)
+    neo[0], neo[-1] = neo[1], neo[-2]
+    tri_window = np.convolve(np.ones(9), np.ones(9), 'full')
+    tri_window /= tri_window.sum()
+    sne = convolve(neo, tri_window, mode='same')
+    return sne
+
+def extract_multi_channel_features(signal):
+    n_channels, time_steps = signal.shape
+    features = []
+
+    for c in range(n_channels):
+        x0 = signal[c]
+        x1 = np.zeros_like(x0)
+        x1[1:] = x0[1:] - x0[:-1]
+        x2 = np.zeros_like(x0)
+        x2[2:] = x1[2:] - x1[1:-1]
+        sne = extract_sne_features(x0)
+
+        features.append(np.stack([x0, x1, x2, sne], axis=0))
+
+    return np.stack(features, axis=1)
+
+def resolve_eeg_file_path(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".fdt":
+        set_path = os.path.splitext(file_path)[0] + ".set"
+        if os.path.exists(set_path):
+            return set_path
+    return file_path
+
+def read_supported_eeg(file_path, preload=False, verbose=False):
+    file_path = resolve_eeg_file_path(file_path)
+    ext = os.path.splitext(file_path)[1].lower()
+    try:
+        if ext == ".set":
+            return mne.io.read_raw_eeglab(file_path, preload=preload, verbose=verbose)
+        if ext == ".edf":
+            return mne.io.read_raw_edf(file_path, preload=preload, verbose=verbose)
+    except Exception as e:
+        if ext == ".set" and "Unknown mat file type" in str(e):
+            raise ValueError(
+                "This .set file is not a valid EEGLAB .set header readable by MNE, or the file is damaged/wrong.\n"
+                "Please choose an EEGLAB-exported .set file, not .fdt, CSV, TXT, or another software's SET format.\n"
+                f"Original error: {e}"
+            ) from e
+        raise
+    raise ValueError(f"Only TXT, EDF, or EEGLAB SET files are supported. Current file: {os.path.basename(file_path)}")
+
+
+def normalize_eeg_float32(eeg_data, invert=False):
+    """Convert once to float32 and standardize each channel in place."""
+    data = np.asarray(eeg_data, dtype=np.float32)
+    if invert:
+        np.negative(data, out=data)
+    channel_mean = np.mean(data, axis=1, dtype=np.float64).astype(np.float32)[:, None]
+    data -= channel_mean
+    channel_std = np.std(data, axis=1, dtype=np.float64).astype(np.float32)[:, None]
+    data /= channel_std + np.float32(1e-6)
+    return data
+
+# -------------------------- MATLAB preprocessing --------------------------
+_MATLAB_ENGINE = None
+_MATLAB_ENGINE_PATHS_READY = False
+_MATLAB_ENGINE_LOCK = threading.Lock()
+_MATLAB_WARMUP_THREAD = None
+_MATLAB_SHUTDOWN_REQUESTED = False
+
+
+def get_matlab_engine():
+    """Start MATLAB once per application session and reuse the engine."""
+    global _MATLAB_ENGINE, _MATLAB_ENGINE_PATHS_READY
+    with _MATLAB_ENGINE_LOCK:
+        if _MATLAB_SHUTDOWN_REQUESTED:
+            raise RuntimeError("MATLAB startup was canceled because the application is closing.")
+
+        if _MATLAB_ENGINE is None:
+            started_engine = matlab.engine.start_matlab()
+            if _MATLAB_SHUTDOWN_REQUESTED:
+                started_engine.quit()
+                raise RuntimeError("MATLAB startup was canceled because the application is closing.")
+            _MATLAB_ENGINE = started_engine
+            _MATLAB_ENGINE_PATHS_READY = False
+
+        if not _MATLAB_ENGINE_PATHS_READY:
+            eeglab_path = r"D:\MATLAB\R2024a\toolbox\eeglab"
+            _MATLAB_ENGINE.addpath(_MATLAB_ENGINE.fullfile(eeglab_path), nargout=0)
+            _MATLAB_ENGINE.addpath(_MATLAB_ENGINE.fullfile(eeglab_path, 'functions'), nargout=0)
+            _MATLAB_ENGINE.addpath(_MATLAB_ENGINE.fullfile(eeglab_path, 'functions', 'guifunc'), nargout=0)
+            _MATLAB_ENGINE.addpath(_MATLAB_ENGINE.fullfile(eeglab_path, 'functions', 'sigprocfunc'), nargout=0)
+            _MATLAB_ENGINE_PATHS_READY = True
+        return _MATLAB_ENGINE
+
+
+def matlab_engine_is_ready():
+    return _MATLAB_ENGINE is not None and _MATLAB_ENGINE_PATHS_READY
+
+
+def warm_up_matlab_engine_async():
+    """Start MATLAB/EEGLAB in the background while TXT data are imported."""
+    global _MATLAB_WARMUP_THREAD
+    if matlab_engine_is_ready():
+        return
+    if _MATLAB_WARMUP_THREAD is not None and _MATLAB_WARMUP_THREAD.is_alive():
+        return
+
+    def worker():
+        try:
+            get_matlab_engine()
+        except Exception:
+            if not _MATLAB_SHUTDOWN_REQUESTED:
+                traceback.print_exc()
+
+    _MATLAB_WARMUP_THREAD = threading.Thread(
+        target=worker,
+        name="matlab-engine-warmup",
+        daemon=True,
+    )
+    _MATLAB_WARMUP_THREAD.start()
+
+
+def call_matlab_preprocess(file_path, fs=500, save_dir=None):
+    if save_dir is None:
+        save_dir = os.path.join(INTERFACE_DATA_DIR, "set")
+    channel_names = ['FP1','FP2','F3','F4','C3','C4','P3','P4','O1','O2','F7','F8','T3','T4','T5','T6']
+
+    try:
+        file_name = os.path.basename(file_path)
+        subject_id_mat = os.path.splitext(file_name)[0]
+        set_filename_mat = subject_id_mat + '_raw_preprocessed.set'
+        full_set_path = os.path.join(save_dir, set_filename_mat)
+
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        eng = get_matlab_engine()
+
+        chan_cell = eng.cell(len(channel_names), 1)
+        for i, name in enumerate(channel_names):
+            eng.workspace['name'] = name
+            eng.eval(f'chan_cell{{{i+1}}} = name;', nargout=0)
+
+        matlab_code = f"""
+                if ~exist('{save_dir}', 'dir')
+                    mkdir('{save_dir}');
+                end
+
+                % 加载原始数据（兼容.set格式，txt预处理后已转为.set）
+                EEG = pop_loadset('filename', '{os.path.basename(file_path)}', 'filepath', '{os.path.dirname(file_path)}');
+                raw_data = EEG.data;
+
+                % Vectorized NaN replacement. Each missing channel value is
+                % replaced by the mean of the available channels at that time.
+                nan_mask = isnan(raw_data);
+                if any(nan_mask(:))
+                    column_mean = mean(raw_data, 1, 'omitnan');
+                    column_mean(isnan(column_mean)) = 0;
+                    nan_linear = find(nan_mask);
+                    [~, nan_columns] = ind2sub(size(raw_data), nan_linear);
+                    raw_data(nan_linear) = reshape(column_mean(nan_columns), [], 1);
+                end
+
+                % 新增：平均重参考（将每个通道数据减去所有通道的平均值）
+                avg_ref = mean(raw_data, 1);  % 计算所有通道的平均值（时间点维度）
+                raw_data = raw_data - avg_ref;  % 应用平均重参考
+
+                % 50Hz陷波滤波
+                EEG_tmp = eeg_emptyset();
+                EEG_tmp.data = raw_data;
+                EEG_tmp.srate = {fs};
+                EEG_tmp.nbchan = size(EEG_tmp.data, 1);
+                EEG_tmp.pnts = size(EEG_tmp.data, 2);
+                EEG_tmp.trials = 1;
+                EEG_tmp = pop_eegfiltnew(EEG_tmp, 47, 53, 3300, 1);
+
+                % 3-70Hz带通滤波
+                EEG_tmp = pop_eegfiltnew(EEG_tmp, 3, 70, [], 0);
+
+                % 构建EEG结构并保存
+                EEG = eeg_emptyset();
+                EEG.data = EEG_tmp.data;
+                EEG.srate = {fs};
+                EEG.nbchan = size(EEG.data, 1);
+                EEG.pnts = size(EEG.data, 2);
+                EEG.trials = 1;
+                EEG.times = (0:EEG.pnts - 1) / {fs};
+                EEG.setname = '{subject_id_mat}';
+                EEG.filename = '{set_filename_mat}';
+                EEG.filepath = '{save_dir}';
+
+                % 设置通道名
+                if length(chan_cell) ~= EEG.nbchan
+                    warning('通道名称数量不匹配');
+                else
+                    for ch = 1:EEG.nbchan
+                        EEG.chanlocs(ch).labels = chan_cell{{ch}};
+                        EEG.chanlocs(ch).type = 'EEG';
+                    end
+                end
+
+                EEG = eeg_checkset(EEG);
+                pop_saveset(EEG, 'filename', '{set_filename_mat}', 'filepath', '{save_dir}');
+            """
+        eng.eval(matlab_code, nargout=0)
+        return full_set_path
+    except Exception as e:
+        traceback.print_exc()
+        raise RuntimeError(f"MATLAB preprocessing failed: {str(e)}")
+
+# -------------------------- 后处理相关函数 --------------------------
+def calculate_swi(spike_times, total_duration):
+    # 修复：先扁平化spike_times（处理可能混入的列表），再过滤无效值
+    # 步骤1：扁平化数据（如果有嵌套列表，提取所有数值）
+    flat_spike_times = []
+    for t in spike_times:
+        if isinstance(t, list):  # 如果元素是列表，展开
+            flat_spike_times.extend([x for x in t if isinstance(x, (int, float))])
+        elif isinstance(t, (int, float)):  # 如果是数值，直接添加
+            flat_spike_times.append(t)
+
+    # 步骤2：过滤范围外的时间（确保只保留0到total_duration之间的数值）
+    valid_spike_times = [t for t in flat_spike_times if 0 <= t < total_duration]
+
+    if not valid_spike_times or total_duration <= 0:
+        return 0.0, 0, 0
+
+    # 计算含棘波的秒数（取整数秒，去重）
+    total_seconds = int(np.ceil(total_duration))
+    spike_seconds = len(set([int(t) for t in valid_spike_times]))
+
+    # 计算SWI值
+    swi = (spike_seconds / total_seconds) * 100 if total_seconds > 0 else 0
+    return round(swi, 2), spike_seconds, total_seconds
+
+def save_spike_data(spike_times, eeg_data, fs, default_filename="spike_results.npz",
+                    high_prob_spikes=None, low_prob_spikes=None, save_path=None,
+                    show_dialog=True, parent=None, total_record_duration=None,
+                    analyzable_duration=None, excluded_duration=None,
+                    spike_detection_elapsed=None, source_file_path=None,
+                    source_intervals=None, source_invert=False,
+                    source_channel_names=None):
+    if save_path is None:
+        save_path, _ = QFileDialog.getSaveFileName(
+            parent, "Save Spike Detection Results", default_filename, "NPZ files (*.npz);;All files (*.*)"
+        )
+    if not save_path:
+        return None
+    try:
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        high_prob_spikes = high_prob_spikes if high_prob_spikes is not None else []
+        low_prob_spikes = low_prob_spikes if low_prob_spikes is not None else []
+        if not source_file_path:
+            raise ValueError(
+                "Cannot create a lightweight result because the EEG source path is unavailable. "
+                "Please import/preprocess the EEG again before saving."
+            )
+        source_file_path = os.path.abspath(source_file_path)
+        if not os.path.exists(source_file_path):
+            raise FileNotFoundError(f"EEG source file does not exist: {source_file_path}")
+        if os.path.splitext(resolve_eeg_file_path(source_file_path))[1].lower() not in (".edf", ".set"):
+            raise ValueError(
+                "Lightweight results require an EDF/SET EEG source. "
+                "Please run preprocessing (or import a preprocessed SET) before saving."
+            )
+
+        np.savez_compressed(
+            save_path,
+            spike_times=np.array(spike_times, dtype=float),
+            high_prob_spikes=np.array(high_prob_spikes, dtype=float),
+            low_prob_spikes=np.array(low_prob_spikes, dtype=float),
+            fs=fs,
+            result_format_version=2,
+            source_file_path=source_file_path,
+            source_intervals=np.asarray(source_intervals or [], dtype=float).reshape(-1, 2),
+            source_invert=bool(source_invert),
+            source_channel_names=np.asarray(source_channel_names or [], dtype=str),
+            total_record_duration=total_record_duration,
+            analyzable_duration=analyzable_duration,
+            excluded_duration=excluded_duration,
+            spike_detection_elapsed=spike_detection_elapsed,
+            save_time=time.strftime("%Y-%m-%d %H:%M:%S"),
+            **{
+                "总记录时长": total_record_duration,
+                "可分析时长": analyzable_duration,
+                "被排除时长": excluded_duration,
+                "棘波检测用时": spike_detection_elapsed,
+            }
+        )
+        if show_dialog:
+            QMessageBox.information(parent, "Saved", f"Spike data saved to:\n{save_path}")
+        return save_path
+    except Exception as e:
+        QMessageBox.critical(parent, "Save Failed", f"Error: {str(e)}")
+        return None
+
+
+def _load_eeg_from_source(source_file_path, source_intervals, source_invert,
+                          source_channel_names, expected_fs):
+    """Rebuild normalized EEG data referenced by a lightweight result file."""
+    raw = read_supported_eeg(source_file_path, preload=False, verbose=False)
+
+    wanted_channels = [str(ch) for ch in source_channel_names]
+    if wanted_channels:
+        def norm_ch(name):
+            text = re.sub(r'[^A-Z0-9]', '', str(name).upper())
+            for token in ('EEG', 'REF', 'LE', 'AVG'):
+                text = text.replace(token, '')
+            return text
+
+        available = {norm_ch(ch): ch for ch in raw.ch_names}
+        picks = []
+        for wanted in wanted_channels:
+            wanted_norm = norm_ch(wanted)
+            match = available.get(wanted_norm)
+            if match is None:
+                match = next((ch for ch in raw.ch_names if wanted_norm in norm_ch(ch)), None)
+            if match is None:
+                raise ValueError(f"EEG source is missing channel: {wanted}")
+            picks.append(match)
+        raw.pick_channels(picks, ordered=True)
+
+    actual_fs = float(raw.info['sfreq'])
+    if expected_fs and not np.isclose(actual_fs, float(expected_fs)):
+        raise ValueError(
+            f"EEG source sampling rate changed: result={expected_fs} Hz, source={actual_fs} Hz"
+        )
+
+    intervals = np.asarray(source_intervals, dtype=float).reshape(-1, 2)
+    segment_specs = []
+    if intervals.size:
+        total_duration = raw.n_times / actual_fs
+        for start_sec, end_sec in intervals:
+            tmin = max(0.0, float(start_sec))
+            tmax = min(total_duration, float(end_sec))
+            if tmax > tmin:
+                start_sample = max(0, int(round(tmin * actual_fs)))
+                end_sample = min(raw.n_times, int(round(tmax * actual_fs)))
+                if end_sample > start_sample:
+                    segment_specs.append((start_sample, end_sample))
+        if not segment_specs:
+            raise ValueError("None of the saved EEG intervals exists in the source file.")
+    else:
+        segment_specs = [(0, raw.n_times)]
+
+    total_samples = sum(end - start for start, end in segment_specs)
+    eeg_data = np.empty((len(raw.ch_names), total_samples), dtype=np.float32)
+    # Ten-minute chunks keep peak temporary memory modest while avoiding the
+    # per-call overhead of hundreds of tiny reads from multi-gigabyte FDT files.
+    chunk_samples = max(1, int(actual_fs * 600.0))
+    write_pos = 0
+    for start_sample, end_sample in segment_specs:
+        for chunk_start in range(start_sample, end_sample, chunk_samples):
+            chunk_end = min(end_sample, chunk_start + chunk_samples)
+            block = raw.get_data(start=chunk_start, stop=chunk_end)
+            block_len = chunk_end - chunk_start
+            eeg_data[:, write_pos:write_pos + block_len] = block
+            write_pos += block_len
+
+    eeg_data = normalize_eeg_float32(eeg_data, invert=source_invert)
+    return eeg_data, actual_fs
+
+
+def load_spike_data():
+    load_path, _ = QFileDialog.getOpenFileName(
+        None, "Load Spike Detection Results", "", "NPZ files (*.npz);;All files (*.*)"
+    )
+    if not load_path:
+        return None
+    try:
+        with np.load(load_path, allow_pickle=True) as data:
+            if "high_prob_spikes" in data.files or "low_prob_spikes" in data.files:
+                high_prob_spikes = data["high_prob_spikes"].tolist() if "high_prob_spikes" in data.files else []
+                low_prob_spikes = data["low_prob_spikes"].tolist() if "low_prob_spikes" in data.files else []
+            else:
+                # 兼容旧版本结果：旧文件只保存合并后的spike_times，无法区分高/低概率，只能按高概率加载。
+                high_prob_spikes = [(float(t), 1.0) for t in data["spike_times"].tolist()]
+                low_prob_spikes = []
+
+            spike_times = data["spike_times"].tolist()
+            fs = data["fs"].item()
+            save_time = data["save_time"].item()
+
+            if "eeg_data" in data.files:
+                # Backward compatibility with the original, large result format.
+                eeg_data = data["eeg_data"]
+                source_file_path = ""
+                source_intervals = []
+                source_invert = False
+                source_channel_names = []
+            else:
+                source_file_path = str(data["source_file_path"].item())
+                source_intervals = data["source_intervals"].tolist() if "source_intervals" in data.files else []
+                source_invert = bool(data["source_invert"].item()) if "source_invert" in data.files else False
+                source_channel_names = data["source_channel_names"].tolist() if "source_channel_names" in data.files else []
+
+                if not os.path.exists(source_file_path):
+                    QMessageBox.warning(
+                        None,
+                        "EEG Source Not Found",
+                        f"The EEG source recorded in this result cannot be found:\n{source_file_path}\n\n"
+                        "Please locate the source EEG file."
+                    )
+                    replacement_path, _ = QFileDialog.getOpenFileName(
+                        None,
+                        "Locate EEG Source",
+                        os.path.dirname(load_path),
+                        "EEG files (*.edf *.set *.fdt);;All files (*.*)"
+                    )
+                    if not replacement_path:
+                        return None
+                    source_file_path = resolve_eeg_file_path(replacement_path)
+
+                eeg_data, fs = _load_eeg_from_source(
+                    source_file_path,
+                    source_intervals,
+                    source_invert,
+                    source_channel_names,
+                    fs
+                )
+
+        return {
+            "spike_times": spike_times,
+            "high_prob_spikes": high_prob_spikes,
+            "low_prob_spikes": low_prob_spikes,
+            "eeg_data": eeg_data,
+            "fs": fs,
+            "save_time": save_time,
+            "load_path": load_path,
+            "source_file_path": source_file_path,
+            "source_intervals": source_intervals,
+            "source_invert": source_invert,
+            "source_channel_names": source_channel_names,
+        }
+    except Exception as e:
+        QMessageBox.critical(None, "Load Failed", f"Error: {str(e)}\nPlease confirm this is a valid spike result file.")
+        return None
+
+
+class SpikeConfirmDialog(QDialog):
+    def __init__(self, spike_time, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Confirm Spike")
+        self.setFixedSize(420, 190)
+
+        layout = QVBoxLayout()
+        self.label = QLabel(f"Confirm the region at {spike_time:.3f} s as a spike?")
+        self.label.setStyleSheet("font-size: 20px;")
+        layout.addWidget(self.label)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.button(QDialogButtonBox.Ok).setText("Confirm (Purple)")
+        button_box.button(QDialogButtonBox.Cancel).setText("Reject (Remove)")
+        layout.addWidget(button_box)
+
+        self.setLayout(layout)
+
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+
+class TimeRowRangeDialog(QDialog):
+    def __init__(self, total_rows, fs=500, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Data Range (Rows or Time)")
+        self.setFixedSize(560, 380)
+        self.total_rows = total_rows
+        self.fs = fs
+        self.total_seconds = total_rows / fs
+
+        self.selected_start_row = 1
+        self.selected_end_row = total_rows
+        self.selected_start_time = QTime(0, 0, 0)
+        self.selected_end_time = self.seconds_to_qtime(self.total_seconds)
+
+        layout = QVBoxLayout()
+
+        self.info_label = QLabel(
+            f"File rows: {total_rows} (sampling rate: {fs} Hz, total duration: {self.format_seconds(self.total_seconds)})\n"
+            "Select the range to keep:"
+        )
+        self.info_label.setStyleSheet("font-size: 20px;")
+        layout.addWidget(self.info_label)
+
+        row_group = QWidget()
+        row_layout = QVBoxLayout(row_group)
+        row_layout.addWidget(QLabel("--- Row Range ---"))
+
+        start_row_layout = QHBoxLayout()
+        start_row_layout.addWidget(QLabel("Start Row:"))
+        self.start_row_input = QSpinBox()
+        self.start_row_input.setRange(1, total_rows)
+        self.start_row_input.setValue(1)
+        start_row_layout.addWidget(self.start_row_input)
+        row_layout.addLayout(start_row_layout)
+
+        end_row_layout = QHBoxLayout()
+        end_row_layout.addWidget(QLabel("End Row:"))
+        self.end_row_input = QSpinBox()
+        self.end_row_input.setRange(1, total_rows)
+        self.end_row_input.setValue(total_rows)
+        end_row_layout.addWidget(self.end_row_input)
+        row_layout.addLayout(end_row_layout)
+        layout.addWidget(row_group)
+
+        time_group = QWidget()
+        time_layout = QVBoxLayout(time_group)
+        time_layout.addWidget(QLabel("--- Time Range (HH:MM:SS) ---"))
+
+        start_time_layout = QHBoxLayout()
+        start_time_layout.addWidget(QLabel("Start Time:"))
+        self.start_time_input = QTimeEdit()
+        self.start_time_input.setDisplayFormat("HH:mm:ss")
+        self.start_time_input.setTime(self.selected_start_time)
+        start_time_layout.addWidget(self.start_time_input)
+        time_layout.addLayout(start_time_layout)
+
+        end_time_layout = QHBoxLayout()
+        end_time_layout.addWidget(QLabel("End Time:"))
+        self.end_time_input = QTimeEdit()
+        self.end_time_input.setDisplayFormat("HH:mm:ss")
+        self.end_time_input.setTime(self.selected_end_time)
+        end_time_layout.addWidget(self.end_time_input)
+        time_layout.addLayout(end_time_layout)
+        layout.addWidget(time_group)
+
+        btn_layout = QHBoxLayout()
+        self.all_btn = QPushButton("Keep All")
+        self.all_btn.clicked.connect(self.select_all)
+        btn_layout.addWidget(self.all_btn)
+        layout.addLayout(btn_layout)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.button(QDialogButtonBox.Ok).setText("Confirm")
+        button_box.button(QDialogButtonBox.Cancel).setText("Cancel")
+        layout.addWidget(button_box)
+
+        self.setLayout(layout)
+
+        button_box.accepted.connect(self.on_accept)
+        button_box.rejected.connect(self.reject)
+        self.start_time_input.timeChanged.connect(self.update_start_row_from_time)
+        self.end_time_input.timeChanged.connect(self.update_end_row_from_time)
+        self.start_row_input.valueChanged.connect(self.update_start_time_from_row)
+        self.end_row_input.valueChanged.connect(self.update_end_time_from_row)
+
+    def qtime_to_seconds(self, qtime):
+        return qtime.hour() * 3600 + qtime.minute() * 60 + qtime.second()
+
+    def seconds_to_qtime(self, seconds):
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        return QTime(hours, minutes, secs)
+
+    def format_seconds(self, seconds):
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    def update_start_row_from_time(self):
+        secs = self.qtime_to_seconds(self.start_time_input.time())
+        row = int(secs * self.fs) + 1
+        row = max(1, min(row, self.total_rows))
+        self.start_row_input.setValue(row)
+
+    def update_end_row_from_time(self):
+        secs = self.qtime_to_seconds(self.end_time_input.time())
+        row = int(secs * self.fs) + 1
+        row = max(1, min(row, self.total_rows))
+        self.end_row_input.setValue(row)
+
+    def update_start_time_from_row(self):
+        row = self.start_row_input.value()
+        secs = (row - 1) / self.fs
+        self.start_time_input.setTime(self.seconds_to_qtime(secs))
+
+    def update_end_time_from_row(self):
+        row = self.end_row_input.value()
+        secs = (row - 1) / self.fs
+        self.end_time_input.setTime(self.seconds_to_qtime(secs))
+
+    def select_all(self):
+        self.start_row_input.setValue(1)
+        self.end_row_input.setValue(self.total_rows)
+        self.start_time_input.setTime(QTime(0, 0, 0))
+        self.end_time_input.setTime(self.seconds_to_qtime(self.total_seconds))
+
+    def on_accept(self):
+        self.selected_start_row = self.start_row_input.value()
+        self.selected_end_row = self.end_row_input.value()
+        if self.selected_start_row > self.selected_end_row:
+            QMessageBox.warning(self, "Input Error", "Start row cannot be greater than end row.")
+            return
+        self.accept()
+
+def parse_sleep_stage_file(sleep_file_path):
+    try:
+        sleep_df = pd.read_csv(sleep_file_path)
+        sleep_df.columns = [str(col).strip() for col in sleep_df.columns]
+        lower_to_original = {col.lower(): col for col in sleep_df.columns}
+
+        # Source 1: exported staging CSV with latency,type; each row defaults to 30 seconds.
+        if 'latency' in lower_to_original and 'type' in lower_to_original:
+            latency_col = lower_to_original['latency']
+            stage_col = lower_to_original['type']
+            sleep_df[latency_col] = pd.to_numeric(sleep_df[latency_col], errors='coerce')
+            sleep_df = sleep_df.dropna(subset=[latency_col])
+            stage_text = sleep_df[stage_col].astype(str).str.upper().str.strip()
+            n_stages = sleep_df[stage_text.isin(['N1', 'N2', 'N3', 'NREM'])].copy()
+            if len(n_stages) == 0:
+                QMessageBox.warning(None, "No Sleep Stage Data", "No N1/N2/N3/NREM stages were found in the sleep-stage file.")
+                return None, None, None
+            n_stages = n_stages.sort_values(latency_col)
+            sleep_intervals = [(float(t), float(t) + 30.0, str(stage).upper().strip())
+                               for t, stage in zip(n_stages[latency_col], n_stages[stage_col])]
+            return sleep_intervals[0][0], sleep_intervals[-1][1], sleep_intervals
+
+        # Source 2: manual GUI labels with start_sec,end_sec,stage.
+        required = {'start_sec', 'end_sec', 'stage'}
+        if required.issubset(lower_to_original):
+            start_col = lower_to_original['start_sec']
+            end_col = lower_to_original['end_sec']
+            stage_col = lower_to_original['stage']
+            sleep_df[start_col] = pd.to_numeric(sleep_df[start_col], errors='coerce')
+            sleep_df[end_col] = pd.to_numeric(sleep_df[end_col], errors='coerce')
+            sleep_df = sleep_df.dropna(subset=[start_col, end_col])
+            stage_text = sleep_df[stage_col].astype(str).str.upper().str.strip()
+            n_stages = sleep_df[stage_text.isin(['N1', 'N2', 'N3', 'NREM'])].copy()
+            if len(n_stages) == 0:
+                QMessageBox.warning(None, "No Sleep Stage Data", "No NREM/N1/N2/N3 stages were found in the manual annotation file.")
+                return None, None, None
+            n_stages = n_stages.sort_values(start_col)
+            sleep_intervals = []
+            for _, row in n_stages.iterrows():
+                start = float(row[start_col])
+                end = float(row[end_col])
+                if end > start:
+                    sleep_intervals.append((start, end, str(row[stage_col]).upper().strip()))
+            if not sleep_intervals:
+                QMessageBox.warning(None, "No Valid Sleep Stage", "The NREM segment start/end times in the manual annotation file are invalid.")
+                return None, None, None
+            return sleep_intervals[0][0], sleep_intervals[-1][1], sleep_intervals
+
+        raise ValueError("CSV must contain latency,type or manual annotation fields start_sec,end_sec,stage")
+
+    except Exception as e:
+        QMessageBox.critical(None, "Sleep-Stage File Parse Failed", "Error: " + str(e) + "\nSupported formats: 1) latency,type; 2) start_sec,end_sec,stage")
+        return None, None, None
+
+
+def extract_base_offset_from_filename(sleep_filename):
+    # 睡眠分期CSV中的latency已经是以秒为单位、从数据开始计时；不再从文件名提取偏移。
+    return 0
+
+def calculate_txt_row_range(base_offset, first_n_latency, last_n_latency, fs=500):
+    start_row = int((base_offset + first_n_latency) * fs) + 1
+    end_row = int((base_offset + last_n_latency) * fs)
+    return start_row, end_row
+
+
+def detect_txt_header_rows(file_path):
+    """Return 1 when the first non-empty TXT row is a channel-name header."""
+    with open(file_path, 'rb') as file_obj:
+        first_line = file_obj.readline().decode('utf-8', errors='ignore').strip()
+    if not first_line:
+        return 0
+    first_value = first_line.replace(',', ' ').replace('\t', ' ').split()[0]
+    try:
+        float(first_value)
+        return 0
+    except ValueError:
+        return 1
+
+
+def build_txt_sparse_index(file_path, required_physical_row, stride=100000):
+    """Build in-memory byte offsets for every `stride` physical TXT rows."""
+    offsets = [0]
+    newline_count = 0
+    absolute_offset = 0
+    chunk_size = 64 * 1024 * 1024
+    with open(file_path, 'rb', buffering=chunk_size) as file_obj:
+        while newline_count < required_physical_row:
+            chunk = file_obj.read(chunk_size)
+            if not chunk:
+                break
+            newline_positions = np.flatnonzero(np.frombuffer(chunk, dtype=np.uint8) == 10)
+            if newline_positions.size:
+                ordinals = newline_count + np.arange(1, newline_positions.size + 1, dtype=np.int64)
+                selected = newline_positions[(ordinals % stride) == 0]
+                offsets.extend((absolute_offset + selected + 1).tolist())
+                newline_count += int(newline_positions.size)
+            absolute_offset += len(chunk)
+
+    indexed_rows = newline_count + 1
+    if indexed_rows < required_physical_row:
+        raise ValueError(
+            f"TXT ends at approximately row {indexed_rows:,}, but row {required_physical_row:,} is required. "
+            "Please confirm that the sleep-stage CSV matches this TXT file."
+        )
+
+    return np.asarray(offsets, dtype=np.int64)
+
+
+def read_txt_intervals_fast(file_path, interval_rows, channel_count=16):
+    """Scan the TXT once and parse only the requested 1-based row intervals."""
+    if not interval_rows:
+        raise ValueError("No TXT intervals were provided.")
+
+    header_rows = detect_txt_header_rows(file_path)
+    physical_intervals = [
+        (int(start) + header_rows, int(end) + header_rows)
+        for start, end, _ in interval_rows
+    ]
+    expected_rows = sum(end - start + 1 for start, end in physical_intervals)
+    output = np.empty((channel_count, expected_rows), dtype=np.float32)
+    valid_mask = np.ones(expected_rows, dtype=bool)
+    interval_offsets = []
+    output_offset = 0
+    for start_row, end_row in physical_intervals:
+        interval_offsets.append(output_offset)
+        output_offset += end_row - start_row + 1
+
+    def parse_block(block, output_start, row_count):
+        frame = pd.read_csv(
+                io.BytesIO(block),
+                sep='\t',
+                header=None,
+                usecols=list(range(channel_count)),
+                dtype=np.float32,
+                engine='c',
+                skip_blank_lines=False,
+            )
+        values = frame.to_numpy(dtype=np.float32, copy=False)
+        if len(values) != row_count:
+            raise ValueError(
+                f"Expected {row_count:,} TXT rows in a selected block, but read {len(values):,}."
+            )
+        block_valid = np.isfinite(values).all(axis=1)
+        output[:, output_start:output_start + row_count] = values.T
+        valid_mask[output_start:output_start + row_count] = block_valid
+        return int((~block_valid).sum())
+
+    # Parse selected byte blocks while the file is scanned sequentially. This
+    # avoids the old second disk pass over all selected intervals. A bounded
+    # queue prevents large byte blocks from accumulating in memory.
+    pending = set()
+    invalid_count = 0
+    carry = b""
+    first_physical_row = 1
+    interval_index = 0
+    chunk_size = 64 * 1024 * 1024
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        with open(file_path, 'rb', buffering=chunk_size) as file_obj:
+            while interval_index < len(physical_intervals):
+                chunk = file_obj.read(chunk_size)
+                if chunk:
+                    data = carry + chunk
+                elif carry:
+                    data = carry + b'\n'
+                    carry = b""
+                else:
+                    break
+
+                last_newline = data.rfind(b'\n')
+                if last_newline < 0:
+                    carry = data
+                    continue
+                complete = data[:last_newline + 1]
+                carry = data[last_newline + 1:]
+                newline_positions = np.flatnonzero(np.frombuffer(complete, dtype=np.uint8) == 10)
+                line_count = int(newline_positions.size)
+                last_physical_row = first_physical_row + line_count - 1
+
+                while interval_index < len(physical_intervals):
+                    start_row, end_row = physical_intervals[interval_index]
+                    if start_row > last_physical_row:
+                        break
+                    overlap_start = max(start_row, first_physical_row)
+                    overlap_end = min(end_row, last_physical_row)
+                    if overlap_end >= overlap_start:
+                        local_start = overlap_start - first_physical_row
+                        local_end = overlap_end - first_physical_row
+                        byte_start = 0 if local_start == 0 else int(newline_positions[local_start - 1]) + 1
+                        byte_end = int(newline_positions[local_end]) + 1
+                        block_output_start = interval_offsets[interval_index] + overlap_start - start_row
+                        pending.add(executor.submit(
+                            parse_block,
+                            complete[byte_start:byte_end],
+                            block_output_start,
+                            overlap_end - overlap_start + 1,
+                        ))
+                        if len(pending) >= 8:
+                            completed, pending = concurrent.futures.wait(
+                                pending,
+                                return_when=concurrent.futures.FIRST_COMPLETED,
+                            )
+                            invalid_count += sum(job.result() for job in completed)
+                    if end_row <= last_physical_row:
+                        interval_index += 1
+                    else:
+                        break
+                first_physical_row += line_count
+        invalid_count += sum(job.result() for job in pending)
+
+    if interval_index < len(physical_intervals):
+        required_row = physical_intervals[interval_index][1]
+        raise ValueError(
+            f"TXT ends at approximately row {first_physical_row - 1:,}, but row {required_row:,} is required. "
+            "Please confirm that the sleep-stage CSV matches this TXT file."
+        )
+    if invalid_count:
+        output = output[:, valid_mask]
+    return output, invalid_count, header_rows
+
+class SleepStageImportDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import Data by Sleep Stage")
+        self.setFixedSize(760, 560)
+
+        self.txt_file_path = None
+        self.data_file_path = None
+        self.selected_start_time = None
+        self.selected_end_time = None
+        self.selected_start_row = None
+        self.selected_end_row = None
+        self.total_rows = None
+        self.fs = 500
+        self.raw_header = None
+
+        layout = QVBoxLayout()
+
+        self.sleep_source_label = QLabel("Sleep-stage source: choose an existing CSV, or open the manual staging tool to create one.")
+        layout.addWidget(self.sleep_source_label)
+
+        source_btn_row = QHBoxLayout()
+        self.sleep_file_label = QLabel("No sleep-stage file selected")
+        self.sleep_file_btn = QPushButton("1A. Select Sleep-Stage CSV")
+        self.sleep_file_btn.clicked.connect(self.select_sleep_file)
+        source_btn_row.addWidget(self.sleep_file_btn)
+
+        self.manual_sleep_btn = QPushButton("1B. Manual Sleep Staging")
+        self.manual_sleep_btn.clicked.connect(self.open_manual_sleep_label_gui)
+        source_btn_row.addWidget(self.manual_sleep_btn)
+        layout.addLayout(source_btn_row)
+        layout.addWidget(self.sleep_file_label)
+
+        self.txt_file_label = QLabel("No TXT/EDF/SET file selected")
+        self.txt_file_btn = QPushButton("2. Select Matching EEG TXT/EDF/SET File")
+        self.txt_file_btn.clicked.connect(self.select_txt_file)
+        self.txt_file_btn.setEnabled(False)
+        layout.addWidget(self.txt_file_btn)
+        layout.addWidget(self.txt_file_label)
+
+        self.result_group = QWidget()
+        self.result_layout = QVBoxLayout(self.result_group)
+        self.result_label = QLabel("Waiting for file selection...")
+        self.result_layout.addWidget(self.result_label)
+        layout.addWidget(self.result_group)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.button(QDialogButtonBox.Ok).setText("Import This Range")
+        button_box.button(QDialogButtonBox.Cancel).setText("Cancel")
+        button_box.accepted.connect(self.on_accept)
+        button_box.rejected.connect(self.reject)
+        button_box.button(QDialogButtonBox.Ok).setEnabled(False)
+        self.ok_button = button_box.button(QDialogButtonBox.Ok)
+        layout.addWidget(button_box)
+
+        self.setLayout(layout)
+
+        self.sleep_file_path = None
+        self.first_n_latency = None
+        self.last_n_latency = None
+        self.sleep_intervals = []
+        self.base_offset = None
+        self.record_end_time = None
+
+    def open_manual_sleep_label_gui(self):
+        os.makedirs(MANUAL_SLEEP_LABEL_DIR, exist_ok=True)
+        if not os.path.exists(MANUAL_SLEEP_STAGE_GUI):
+            QMessageBox.critical(self, "Manual Tool Missing", "Not found:\n" + MANUAL_SLEEP_STAGE_GUI)
+            return
+        env = os.environ.copy()
+        env["MANUAL_SLEEP_LABEL_DIR"] = MANUAL_SLEEP_LABEL_DIR
+        try:
+            subprocess.Popen([sys.executable, MANUAL_SLEEP_STAGE_GUI], cwd=os.getcwd(), env=env)
+        except Exception as e:
+            QMessageBox.critical(self, "Manual Tool Launch Failed", str(e))
+            return
+        QMessageBox.information(
+            self,
+            "Manual Tool Opened",
+            "Select an EDF/SET file in the manual staging tool and save sleep stages.\n"
+            + "Labels will be saved to:\n" + MANUAL_SLEEP_LABEL_DIR + "\n\n"
+            + "After saving, return here and click 1A. Select Sleep-Stage CSV to choose the generated *_sleep_stages.csv file."
+        )
+
+    def select_sleep_file(self):
+        default_dir = MANUAL_SLEEP_LABEL_DIR if os.path.isdir(MANUAL_SLEEP_LABEL_DIR) else os.getcwd()
+        sleep_file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Sleep-Stage File", default_dir, "CSV files (*.csv);;All files (*.*)"
+        )
+        if not sleep_file_path:
+            return
+
+        self.sleep_file_path = sleep_file_path
+        sleep_filename = os.path.basename(sleep_file_path)
+        self.sleep_file_label.setText(f"Sleep-stage file:\n{sleep_filename}")
+
+        self.first_n_latency, self.last_n_latency, self.sleep_intervals = parse_sleep_stage_file(sleep_file_path)
+        if self.first_n_latency is None or self.last_n_latency is None or not self.sleep_intervals:
+            self.txt_file_btn.setEnabled(False)
+            return
+
+        # Start MATLAB as soon as a valid staging file is available.  File
+        # selection plus the one-time TXT import usually hides the cold start.
+        warm_up_matlab_engine_async()
+
+        # Estimate the full recording duration from the staging CSV without
+        # scanning a multi-gigabyte TXT merely to count its rows.
+        try:
+            stage_frame = pd.read_csv(sleep_file_path)
+            stage_frame.columns = [str(col).strip().lower() for col in stage_frame.columns]
+            if 'end_sec' in stage_frame.columns:
+                self.record_end_time = float(pd.to_numeric(stage_frame['end_sec'], errors='coerce').max())
+            elif 'latency' in stage_frame.columns:
+                self.record_end_time = float(pd.to_numeric(stage_frame['latency'], errors='coerce').max()) + 30.0
+        except Exception:
+            self.record_end_time = None
+
+        self.base_offset = extract_base_offset_from_filename(sleep_filename)
+        if self.base_offset is None:
+            self.base_offset = 0
+            QMessageBox.information(self, "Base Offset", "Sleep-stage latency is calculated with a 0-second offset.")
+
+        self.txt_file_btn.setEnabled(True)
+        self.result_label.setText(
+            f"Sleep-stage parse result:\n"
+            f"1. First N-stage latency: {self.first_n_latency} s\n"
+            f"2. Last N-stage latency: {self.last_n_latency} s\n"
+            f"3. N-stage segments: {len(self.sleep_intervals)}\n"
+            f"4. Base offset: {self.base_offset}\n"
+            f"Select the matching TXT/EDF/SET file to calculate the data range."
+        )
+
+    def select_txt_file(self):
+        data_file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Matching EEG TXT/EDF/SET File",
+            r"E:\BECT(Rolandic)\Selects\display" if os.path.isdir(r"E:\BECT(Rolandic)\Selects\display") else os.getcwd(),
+            "EEG files (*.txt *.edf *.set *.fdt);;TXT files (*.txt);;EDF files (*.edf);;SET files (*.set);;FDT files (*.fdt);;All files (*.*)"
+        )
+        if not data_file_path:
+            return
+
+        self.txt_file_path = data_file_path
+        self.data_file_path = data_file_path
+        data_filename = os.path.basename(data_file_path)
+        data_ext = os.path.splitext(data_file_path)[1].lower()
+        self.raw_header = None
+        self.txt_file_label.setText(f"EEG file:\n{data_filename}")
+
+        self.selected_start_time = float(self.first_n_latency)
+        self.selected_end_time = float(self.last_n_latency) + 30.0
+
+        if data_ext == ".txt":
+            warm_up_matlab_engine_async()
+            if os.path.getsize(data_file_path) == 0:
+                QMessageBox.warning(self, "Empty TXT File", "The selected TXT file has no valid data rows.")
+                self.ok_button.setEnabled(False)
+                return
+
+            start_row, end_row = calculate_txt_row_range(
+                self.base_offset or 0, self.first_n_latency, self.last_n_latency + 30.0, self.fs
+            )
+
+            estimated_total_rows = (
+                int(self.record_end_time * self.fs)
+                if self.record_end_time is not None and np.isfinite(self.record_end_time)
+                else end_row
+            )
+            self.total_rows = max(end_row, estimated_total_rows)
+            start_row = max(1, start_row)
+            if start_row >= end_row:
+                QMessageBox.warning(self, "Invalid Row Range",
+                    f"Calculated row range is invalid (start row {start_row} >= end row {end_row}).\nPlease check whether the sleep-stage file matches the TXT file.")
+                self.ok_button.setEnabled(False)
+                return
+
+            self.selected_start_row = start_row
+            self.selected_end_row = end_row
+            self.result_label.setText(
+                f"Final data range:\n"
+                f"1. TXT size: {os.path.getsize(data_file_path) / (1024 ** 3):.2f} GB (full row scan skipped)\n"
+                f"2. Base offset: {self.base_offset or 0}\n"
+                f"3. Rows to keep: {start_row} ~ {end_row}\n"
+                f"4. Time range: {(start_row-1)/self.fs:.2f} s ~ {end_row/self.fs:.2f} s\n"
+                f"(Sampling rate: {self.fs} Hz)"
+            )
+        elif data_ext in (".edf", ".set", ".fdt"):
+            try:
+                data_file_path = resolve_eeg_file_path(data_file_path)
+                self.data_file_path = data_file_path
+                self.txt_file_path = data_file_path
+                data_ext = os.path.splitext(data_file_path)[1].lower()
+                raw_header = read_supported_eeg(data_file_path, preload=False, verbose=False)
+                self.raw_header = raw_header
+                file_type = data_ext[1:].upper()
+                self.fs = float(raw_header.info['sfreq'])
+                self.total_rows = int(raw_header.n_times)
+                total_duration = self.total_rows / self.fs
+                start_time = max(0.0, float(self.first_n_latency))
+                end_time = min(total_duration, float(self.last_n_latency) + 30.0)
+                if start_time >= end_time:
+                    QMessageBox.warning(
+                        self,
+                        "Invalid Time Range",
+                        f"Calculated time range is invalid ({start_time:.2f} s >= {end_time:.2f} s).\nPlease check whether the sleep-stage file matches the {file_type} file."
+                    )
+                    self.ok_button.setEnabled(False)
+                    return
+                self.selected_start_time = start_time
+                self.selected_end_time = end_time
+                self.selected_start_row = int(start_time * self.fs) + 1
+                self.selected_end_row = int(end_time * self.fs)
+                self.result_label.setText(
+                    f"Final data range:\n"
+                    f"1. {file_type} total duration: {total_duration:.2f} s\n"
+                    f"2. N-stage segments: {len(self.sleep_intervals)}\n"
+                    f"3. Enclosing time range: {start_time:.2f} s ~ {end_time:.2f} s\n"
+                    f"4. Sample range: {self.selected_start_row} ~ {self.selected_end_row}\n"
+                    f"(Sampling rate: {self.fs:g} Hz)"
+                )
+            except Exception as e:
+                QMessageBox.critical(self, "EEG Read Failed", f"Failed to read EEG file header:\n{str(e)}")
+                self.ok_button.setEnabled(False)
+                return
+        else:
+            QMessageBox.warning(self, "Unsupported Format", f"Only TXT, EDF, SET, or FDT files are supported. Current format: {data_ext}")
+            self.ok_button.setEnabled(False)
+            return
+
+        self.ok_button.setEnabled(True)
+
+
+    def on_accept(self):
+        if self.selected_start_row is None or self.selected_end_row is None or not self.sleep_intervals:
+            QMessageBox.warning(self, "Selection Incomplete", "Please select and calculate both the sleep-stage file and EEG file first.")
+            return
+        self.accept()
+
+# -------------------------- 脑地形图相关函数（核心修改部分） --------------------------
+def calculate_high_pred1_ratios(raw_data, window_center_times, window_pred_map,
+                               channel_names, target_channels, std_coeff=None):  # 移除原std_coeff默认值
+    """
+    计算各通道中"高值窗口且预测为1"的数量及比例
+    新逻辑：高值窗口阈值 = 所有预测为1的窗口的最大值的均值
+    """
+    channel_ratios = {}
+    channel_stats = {}
+
+    for ch_idx, ch_name in enumerate(channel_names):
+        if ch_name not in target_channels:
+            continue
+
+        # 1. 计算每个窗口的最大值，并区分预测为1和0的窗口
+        win_max_list = []          # 所有窗口的最大值
+        pred1_win_max_list = []    # 仅预测为1的窗口的最大值
+        win_time_list = []
+
+        for win_time in window_center_times:
+            # 计算窗口在原始数据中的索引（确保不越界）
+            total_time = raw_data.shape[1] / 500  # 总时长（秒）
+            win_start_idx = int(round(win_time * 500)) - int(0.1 * 500)  # 0.1秒对应50采样点
+            win_end_idx = win_start_idx + int(0.2 * 500)  # 窗口总长度0.2秒
+            win_start_idx = max(0, win_start_idx)
+            win_end_idx = min(raw_data.shape[1], win_end_idx)
+
+            # 窗口内最大值
+            win_max = np.max(raw_data[ch_idx, win_start_idx:win_end_idx])
+            win_max_list.append(win_max)
+            win_time_list.append(win_time)
+
+            # 如果窗口预测为1，记录其最大值
+            if window_pred_map.get(win_time, 0) == 1:
+                pred1_win_max_list.append(win_max)
+
+        total_windows = len(win_max_list)
+        if total_windows == 0:
+            channel_ratios[ch_name] = 0.0
+            channel_stats[ch_name] = {
+                'total_windows': 0,
+                'high_windows': 0,
+                'high_pred1_windows': 0,
+                'ratio': 0.0,
+                'high_threshold': 0.0  # 新增：记录阈值
+            }
+            continue
+
+        # 2. 新逻辑：高值阈值 = 所有预测为1的窗口的最大值的均值
+        if len(pred1_win_max_list) == 0:
+            # 如果没有预测为1的窗口，阈值设为0（避免除零错误）
+            high_threshold = 0.0
+        else:
+            # 核心修改：阈值 = 预测为1的窗口的最大值的均值
+            high_threshold = np.mean(pred1_win_max_list)
+
+        # 3. 统计"高值且预测为1"的窗口
+        high_windows = 0  # 高值窗口总数（无论预测结果）
+        high_pred1_windows = 0  # 高值且预测为1的窗口数
+
+        for win_time, win_max in zip(win_time_list, win_max_list):
+            # 判断是否为高值窗口（大于等于阈值）
+            is_high = (win_max >= high_threshold)
+            if not is_high:
+                continue
+            high_windows += 1
+
+            # 判断该窗口是否预测为1
+            if window_pred_map.get(win_time, 0) == 1:
+                high_pred1_windows += 1
+
+        # 4. 计算比例（高值且预测为1的窗口数 / 总窗口数）
+        ratio = high_pred1_windows / total_windows if total_windows > 0 else 0.0
+        channel_ratios[ch_name] = ratio
+        channel_stats[ch_name] = {
+            'total_windows': total_windows,
+            'high_windows': high_windows,
+            'high_pred1_windows': high_pred1_windows,
+            'ratio': ratio,
+            'high_threshold': high_threshold  # 新增：记录当前通道的阈值
+        }
+
+        # 打印通道统计结果（新增阈值信息）
+        print(f"通道 {ch_name} 统计：")
+        print(f"  总窗口数：{total_windows}")
+        print(f"  预测为1的窗口数：{len(pred1_win_max_list)}")
+        print(f"  高值阈值（预测为1的窗口最大值的均值）：{high_threshold:.4f}")
+        print(f"  高值窗口数：{high_windows}")
+        print(f"  高值且预测为1的窗口数：{high_pred1_windows}")
+        print(f"  比例：{ratio:.2%}\n")
+
+    return channel_ratios, channel_stats
+
+def plot_brain_with_electrodes(raw_data, channel_names, target_channels, channel_counts, sfreq=500):
+    """将电极定位（名称+位置）直接叠加在脑地形图上"""
+    # 提取目标通道数据
+    values = []
+    ch_names_filtered = []
+    for ch in target_channels:
+        if ch in channel_names and ch in channel_counts:
+            values.append(channel_counts[ch]['true_ratio'])
+            ch_names_filtered.append(ch)
+
+    if not ch_names_filtered:
+        return plt.figure()
+
+    # 获取标准10-20电极位置
+    montage = mne.channels.make_standard_montage('standard_1020')
+    pos_dict = montage.get_positions()['ch_pos']
+
+    # 筛选有效通道及其坐标
+    valid_chs = [ch for ch in ch_names_filtered if ch in pos_dict]
+    if not valid_chs:
+        return plt.figure()
+
+    pos_array = np.array([pos_dict[ch] for ch in valid_chs])  # 保留x,y,z坐标
+    values_norm = np.array([values[ch_names_filtered.index(ch)] for ch in valid_chs])
+    if np.max(values_norm) > 0:
+        values_norm = values_norm / np.max(values_norm)  # 归一化用于颜色映射
+    else:
+        values_norm = np.zeros_like(values_norm)
+
+    # 创建画布
+    fig, ax = plt.subplots(figsize=(10, 10))
+
+    # 绘制脑地形图（底图）
+    im, _ = mne.viz.plot_topomap(
+        values_norm,
+        pos=pos_array[:, :2],  # 仅用x,y坐标
+        axes=ax,
+        cmap='jet',
+        show=False,
+        sensors=False,  # 不显示默认电极点（后续手动绘制）
+        sphere=0.12  # 头部球体半径
+    )
+    ax.set_title('Channel-Level Spatial Distribution', fontsize=24, pad=18)
+    cbar = plt.colorbar(im, ax=ax, label='Normalized Rate', shrink=0.8)
+    cbar.ax.tick_params(labelsize=14)
+    cbar.set_label('Normalized Rate', fontsize=16)
+
+    # 计算脑图显示范围，动态调整标注偏移
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    brain_radius = max(xlim[1] - xlim[0], ylim[1] - ylim[0]) / 2  # 脑图显示半径
+    offset_ratio = 0.05  # 偏移比例（控制标注与电极点的距离）
+    offset = brain_radius * offset_ratio
+
+    # 叠加电极点和名称（核心：定位叠在地形图上）
+    for ch_name, (x, y, _) in zip(valid_chs, pos_array):
+        # 绘制电极点（黑色圆点，带白色填充）
+        ax.plot(x, y, 'ko', markersize=8, markeredgewidth=2, markerfacecolor='white')
+
+        # 计算电极相对中心的距离，动态调整标注位置
+        dist_from_center = np.sqrt(x**2 + y**2) / brain_radius
+
+        if dist_from_center > 0.7:  # 边缘电极：沿径向向外偏移
+            dir_x = x / np.sqrt(x**2 + y**2) if (x**2 + y**2) > 0 else 0
+            dir_y = y / np.sqrt(x**2 + y**2) if (x**2 + y**2) > 0 else 0
+            text_x = x + dir_x * offset
+            text_y = y + dir_y * offset
+        else:  # 内部电极：按象限偏移
+            if x >= 0 and y >= 0:  # 右上
+                text_x, text_y = x + offset, y + offset
+            elif x >= 0 and y < 0:  # 右下
+                text_x, text_y = x + offset, y - offset
+            elif x < 0 and y >= 0:  # 左上
+                text_x, text_y = x - offset, y + offset
+            else:  # 左下
+                text_x, text_y = x - offset, y - offset
+
+        # 自动对齐文本（确保朝向脑图外侧）
+        ha = 'left' if text_x > x else 'right'
+        va = 'bottom' if text_y > y else 'top'
+
+        # 标注电极名称（带白色背景框，避免遮挡地形图）
+        ax.text(
+            text_x, text_y,
+            ch_name,
+            fontsize=14,
+            fontweight='bold',
+            horizontalalignment=ha,
+            verticalalignment=va,
+            bbox=dict(facecolor='white', edgecolor='gray', pad=2, alpha=0.9)
+        )
+
+    plt.tight_layout()
+    return fig
+# 界面类
 class EEGAutoSaveProcessor(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("EEG Data Processing Tool (Supports TXT+SET+Sleep Staging)")
-        self.setGeometry(100, 100, 1400, 950)
-        
+        self.setWindowTitle("EEG Spike Detection Tool (TXT/SET/Sleep-Stage Support)")
+        self.setGeometry(100, 100, 1650, 1000)
+
         pg.setConfigOption('foreground', 'd')
         pg.setConfigOption('background', 'w')
-        
+
         self.raw = None
         self.current_data = None
+        # Metadata used by lightweight spike-result files.  The EEG itself stays
+        # in its original EDF/SET source instead of being duplicated in the NPZ.
+        self.eeg_source_path = None
+        self.eeg_source_intervals = []
+        self.eeg_source_invert = False
+        self.txt_raw_data = None
         self.process_step = 0
         self.channel_names = ['FP1','FP2','F3','F4','C3','C4','P3','P4',
                             'O1','O2','F7','F8','T3','T4','T5','T6']
         self.fs = 500
-        
+
         self.window_duration = 15
         self.total_samples = 0
         self.samples_per_window = int(self.window_duration * self.fs)
-        
+
         self.model = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model_weight_path = r"D:\bai\interface\code\fold_3_best_weights.pth"
+        self.model_weight_path = MODEL_WEIGHT_PATH
         self.window_sec = 0.2
         self.half_window = int(self.window_sec * self.fs / 2)
         self.input_window_size = 2 * self.half_window
 
+        # 新增：窗口中心时间和预测结果映射
         self.window_center_times = []
-        self.window_pred_map = {}
-        
+        self.window_pred_map = {}  # 窗口时间 -> 预测标签(0/1)
+
         self.artefact_threshold = 11.0
         self.artefact_idx = []
-        
+
         self.original_y_unit_scale = 1.0
         self.current_y_scale = 1.0
-        
+        self.amplitude_scale = 1.0
+
         self.high_prob_spikes = []
         self.low_prob_spikes = []
+        self.current_annotation_nav_index = None
+        self.manual_label_mode = False
+        self.pending_manual_spike_time = None
+        self.selected_spike_times = set()
         self.region_spike_map = {}
         self.file_path = None
-        
+        self.last_loaded_spike_path = None
+        self.subject_id = None
+        self.original_total_duration_sec = None
+        self.analyzable_duration_sec = None
+        self.excluded_duration_sec = None
+        self.last_detection_elapsed_sec = None
+        self.manual_correction_elapsed_sec = 0.0
+        self.manual_correction_started_at = None
+        self.manual_correction_running = False
+        self.plot_legend = None
+
         self.swi_value = 0.0
         self.spike_seconds = 0
         self.total_seconds = 0
-        
+
         self.init_ui()
         self.init_model()
 
@@ -77,307 +1496,514 @@ class EEGAutoSaveProcessor(QMainWindow):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QHBoxLayout(main_widget)
-        
-        # Left function button panel
+
+        # 左侧功能按钮面板
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
-        left_layout.setSpacing(20)
+        left_layout.setSpacing(10)
         left_panel.setStyleSheet("padding: 20px;")
-        left_panel.setFixedWidth(320)
+        left_panel.setFixedWidth(380)
 
-        left_layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-
-        # 0. Import via Sleep Staging 按钮
-        self.import_sleep_btn = QPushButton("0. Import via Sleep Staging")
-        self.import_sleep_btn.setFixedSize(310, 55)
-        self.import_sleep_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 18px;
-                font-weight: bold;
-                padding: 12px;
-                padding-left: 20px;
-                background-color: #FF5722;
-                color: black;
-                text-align: left;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:disabled {
-                background-color: #FF9E7A;
-            }
-        """)
+        self.import_sleep_btn = QPushButton("0. Import by Sleep Stage")
+        self.import_sleep_btn.setFixedSize(340, 60)
+        self.import_sleep_btn.setStyleSheet("font-size: 24px; padding: 12px; background-color: #FF5722; color: white;")
         self.import_sleep_btn.clicked.connect(self.import_data_by_sleep_stage)
         left_layout.addWidget(self.import_sleep_btn)
 
-        # 1. Import Raw Data 按钮
         self.import_raw_btn = QPushButton("1. Import Raw Data")
-        self.import_raw_btn.setFixedSize(310, 55)
-        self.import_raw_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 18px;
-                font-weight: bold;
-                padding: 12px;
-                padding-left: 20px;
-                background-color: #2196F3;
-                color: black;
-                text-align: left;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:disabled {
-                background-color: #7AB6F5;
-            }
-        """)
+        self.import_raw_btn.setFixedSize(340, 60)
+        self.import_raw_btn.setStyleSheet("font-size: 24px; padding: 12px; background-color: #2196F3; color: white;")
         self.import_raw_btn.clicked.connect(self.import_raw_data)
         left_layout.addWidget(self.import_raw_btn)
 
-        # 2. Import Preprocessed Data 按钮
-        self.import_processed_btn = QPushButton("2. Import Preprocessed Data")
-        self.import_processed_btn.setFixedSize(310, 55)
-        self.import_processed_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 18px;
-                font-weight: bold;
-                padding: 12px;
-                padding-left: 20px;
-                background-color: #9C27B0;
-                color: black;
-                text-align: left;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:disabled {
-                background-color: #B77BD2;
-            }
-        """)
+        self.import_processed_btn = QPushButton("2. Import Preprocessed")
+        self.import_processed_btn.setFixedSize(340, 60)
+        self.import_processed_btn.setStyleSheet("font-size: 24px; padding: 12px; background-color: #9C27B0; color: white;")
         self.import_processed_btn.clicked.connect(self.import_processed_data)
         left_layout.addWidget(self.import_processed_btn)
 
-        # 3. Run Preprocessing 按钮
         self.preprocess_btn = QPushButton("3. Run Preprocessing")
-        self.preprocess_btn.setFixedSize(310, 55)
-        self.preprocess_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 18px;
-                font-weight: bold;
-                padding: 12px;
-                padding-left: 20px;
-                background-color: #4CAF50;
-                color: black;
-                text-align: left;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:disabled {
-                background-color: #8ED190;
-            }
-        """)
+        self.preprocess_btn.setFixedSize(340, 60)
+        self.preprocess_btn.setStyleSheet("font-size: 24px; padding: 12px; background-color: #7B3294; color: white;")
         self.preprocess_btn.clicked.connect(self.run_preprocessing)
         self.preprocess_btn.setEnabled(False)
         left_layout.addWidget(self.preprocess_btn)
 
-        # 4. Spike Detection 按钮
-        self.spike_detect_btn = QPushButton("4. Spike Detection")
-        self.spike_detect_btn.setFixedSize(310, 55)
-        self.spike_detect_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 18px;
-                font-weight: bold;
-                padding: 12px;
-                padding-left: 20px;
-                background-color: #FF9800;
-                color: black;
-                text-align: left;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:disabled {
-                background-color: #FFC060;
-            }
-        """)
+        self.spike_detect_btn = QPushButton("4. Detect Spikes")
+        self.spike_detect_btn.setFixedSize(340, 60)
+        self.spike_detect_btn.setStyleSheet("font-size: 24px; padding: 12px; background-color: #FF9800; color: white;")
         self.spike_detect_btn.clicked.connect(self.run_spike_detection)
         self.spike_detect_btn.setEnabled(False)
         left_layout.addWidget(self.spike_detect_btn)
 
-        # 5. Recalculate SWI 按钮
         self.recalc_swi_btn = QPushButton("5. Recalculate SWI")
-        self.recalc_swi_btn.setFixedSize(310, 55)
-        self.recalc_swi_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 18px;
-                font-weight: bold;
-                padding: 12px;
-                padding-left: 20px;
-                background-color: #F44336;
-                color: black;
-                text-align: left;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:disabled {
-                background-color: #F88A82;
-            }
-        """)
+        self.recalc_swi_btn.setFixedSize(340, 60)
+        self.recalc_swi_btn.setStyleSheet("font-size: 24px; padding: 12px; background-color: #E69F00; color: white;")
         self.recalc_swi_btn.clicked.connect(self.recalculate_swi)
         self.recalc_swi_btn.setEnabled(False)
         left_layout.addWidget(self.recalc_swi_btn)
 
-        # 6. View Brain Topography 按钮
-        self.plot_brain_btn = QPushButton("6. View Brain Topography")
-        self.plot_brain_btn.setFixedSize(310, 55)
-        self.plot_brain_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 18px;
-                font-weight: bold;
-                padding: 12px;
-                padding-left: 20px;
-                background-color: #2E7D32;
-                color: black;
-                text-align: left;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:disabled {
-                background-color: #6DBF71;
-            }
-        """)
+        # 脑地形图按钮
+        self.plot_brain_btn = QPushButton("6. View Spatial Distribution")
+        self.plot_brain_btn.setFixedSize(340, 60)
+        self.plot_brain_btn.setStyleSheet("font-size: 22px; padding: 12px; background-color: #7B3294; color: white;")
         self.plot_brain_btn.clicked.connect(self.show_brain_topography)
         self.plot_brain_btn.setEnabled(False)
         left_layout.addWidget(self.plot_brain_btn)
 
-        # 7. Save Spike Results 按钮
         self.save_spike_btn = QPushButton("7. Save Spike Results")
-        self.save_spike_btn.setFixedSize(310, 55)
-        self.save_spike_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 18px;
-                font-weight: bold;
-                padding: 12px;
-                padding-left: 20px;
-                background-color: #2196F3;
-                color: black;
-                text-align: left;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:disabled {
-                background-color: #7AB6F5;
-            }
-        """)
+        self.save_spike_btn.setFixedSize(340, 60)
+        self.save_spike_btn.setStyleSheet("font-size: 24px; padding: 12px; background-color: #2196F3; color: white;")
         self.save_spike_btn.clicked.connect(self.save_spike_click)
         self.save_spike_btn.setEnabled(False)
         left_layout.addWidget(self.save_spike_btn)
 
-        # 8. Load Spike Results 按钮
         self.load_spike_btn = QPushButton("8. Load Spike Results")
-        self.load_spike_btn.setFixedSize(310, 55)
-        self.load_spike_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 18px;
-                font-weight: bold;
-                padding: 12px;
-                padding-left: 20px;
-                background-color: #9C27B0;
-                color: black;
-                text-align: left;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:disabled {
-                background-color: #B77BD2;
-            }
-        """)
+        self.load_spike_btn.setFixedSize(340, 60)
+        self.load_spike_btn.setStyleSheet("font-size: 24px; padding: 12px; background-color: #9C27B0; color: white;")
         self.load_spike_btn.clicked.connect(self.load_spike_click)
         left_layout.addWidget(self.load_spike_btn)
 
+        self.manual_correction_start_btn = QPushButton("Start Review Timer")
+        self.manual_correction_start_btn.setFixedSize(340, 54)
+        self.manual_correction_start_btn.setStyleSheet("font-size: 22px; padding: 10px; background-color: #455A64; color: white;")
+        self.manual_correction_start_btn.clicked.connect(self.start_manual_correction_timer)
+        left_layout.addWidget(self.manual_correction_start_btn)
+
+        self.manual_correction_pause_btn = QPushButton("Pause Review Timer")
+        self.manual_correction_pause_btn.setFixedSize(340, 54)
+        self.manual_correction_pause_btn.setStyleSheet("font-size: 22px; padding: 10px; background-color: #795548; color: white;")
+        self.manual_correction_pause_btn.clicked.connect(self.pause_manual_correction_timer)
+        self.manual_correction_pause_btn.setEnabled(False)
+        left_layout.addWidget(self.manual_correction_pause_btn)
+
+        self.manual_correction_end_btn = QPushButton("Finish and Save Review")
+        self.manual_correction_end_btn.setFixedSize(340, 54)
+        self.manual_correction_end_btn.setStyleSheet("font-size: 22px; padding: 10px; background-color: #7B3294; color: white;")
+        self.manual_correction_end_btn.clicked.connect(self.end_manual_correction_timer)
+        self.manual_correction_end_btn.setEnabled(False)
+        left_layout.addWidget(self.manual_correction_end_btn)
         left_layout.addStretch()
         main_layout.addWidget(left_panel, stretch=1)
 
-        # Right display area
+        # 右侧显示区域
         self.right_panel = QScrollArea()
         self.right_content = QWidget()
         self.right_layout = QVBoxLayout(self.right_content)
 
-        self.plot_widget = PlotWidget(title="EEG Waveform Display (Green=High-probability Spike, Red=Low-probability Spike, Click Red Area to Confirm/Reject)")
+        self.plot_widget = PlotWidget(title="EEG Waveform View (purple = high-probability spikes, orange = low-probability spikes; click orange regions to confirm/reject)")
         self.plot_widget.showGrid(x=True, y=True)
         self.plot_widget.setMinimumHeight(600)
+        self.plot_widget.setFocusPolicy(Qt.StrongFocus)
+        self.plot_widget.setToolTip("Mouse wheel: move left/right by one 15-second window")
+        self.plot_widget.viewport().installEventFilter(self)
+        self.plot_widget.keyPressEvent = self.keyPressEvent
+        self._original_plot_mouse_press_event = self.plot_widget.mousePressEvent
+        self.plot_widget.mousePressEvent = self.on_plot_mouse_press
         self.plot_widget.scene().sigMouseClicked.connect(self.on_plot_click)
+        self.plot_legend = self.plot_widget.addLegend(offset=(10, 10), labelTextSize='16pt')
         self.right_layout.addWidget(self.plot_widget)
 
         left_axis = self.plot_widget.getAxis('left')
-        left_axis.setStyle(tickLength=0)
-        left_axis.setTicks([])
+        left_axis.setWidth(58)
+        left_axis.setStyle(tickLength=0, tickTextOffset=8)
+        bottom_axis = self.plot_widget.getAxis('bottom')
+        bottom_axis.setStyle(tickFont=QFont("Arial", 10), tickTextOffset=4)
         self.plot_widget.setLabel('left', '')
+
+        control_style = "font-size: 14px;"
+        control_button_style = "font-size: 14px; padding: 2px 6px;"
+        amplitude_layout = QHBoxLayout()
+        amplitude_label = QLabel("Amplitude Scale:")
+        amplitude_label.setStyleSheet(control_style)
+        amplitude_layout.addWidget(amplitude_label)
+        self.decrease_amp_btn = QPushButton("Amp -")
+        self.decrease_amp_btn.setFixedSize(100, 36)
+        self.decrease_amp_btn.setStyleSheet(control_button_style)
+        self.decrease_amp_btn.clicked.connect(lambda: self.adjust_amplitude_scale(-0.2))
+        amplitude_layout.addWidget(self.decrease_amp_btn)
+        self.amp_scale_label = QLabel(f"{self.amplitude_scale:.1f}x")
+        self.amp_scale_label.setMinimumWidth(55)
+        self.amp_scale_label.setStyleSheet(control_style)
+        amplitude_layout.addWidget(self.amp_scale_label)
+        self.increase_amp_btn = QPushButton("Amp +")
+        self.increase_amp_btn.setFixedSize(100, 36)
+        self.increase_amp_btn.setStyleSheet(control_button_style)
+        self.increase_amp_btn.clicked.connect(lambda: self.adjust_amplitude_scale(0.2))
+        amplitude_layout.addWidget(self.increase_amp_btn)
+        self.reset_amp_btn = QPushButton("Reset")
+        self.reset_amp_btn.setFixedSize(90, 36)
+        self.reset_amp_btn.setStyleSheet(control_button_style)
+        self.reset_amp_btn.clicked.connect(self.reset_amplitude_scale)
+        amplitude_layout.addWidget(self.reset_amp_btn)
+        amplitude_layout.addStretch()
+        self.right_layout.addLayout(amplitude_layout)
 
         self.time_slider = QSlider(Qt.Horizontal)
         self.time_slider.setEnabled(False)
-        self.time_slider.setToolTip("Drag to control the 15-second time window")
+        self.time_slider.setToolTip("Drag to control the displayed 15-second time window")
+        self.time_slider.keyPressEvent = self.keyPressEvent
         self.time_slider.valueChanged.connect(self.update_plot_by_slider)
-        self.right_layout.addWidget(QLabel("Time Range Control (15-second window):"))
+        time_range_label = QLabel("Time Range Control (15-second window):")
+        time_range_label.setStyleSheet(control_style)
+        self.right_layout.addWidget(time_range_label)
         self.right_layout.addWidget(self.time_slider)
 
-        # Bottom horizontal layout container
-        bottom_container = QWidget()
-        bottom_layout = QHBoxLayout(bottom_container)
-        bottom_layout.setSpacing(15)
-
-        # SWI indicator label
-        self.swi_label = QLabel("【Spike Wave Index (SWI) Indicators】\nWaiting for detection or result loading...")
+        self.swi_label = QLabel("Spike-Wave Index (SWI)\nWaiting for detection or loaded results...")
         self.swi_label.setStyleSheet("""
-            font-size: 18px; 
-            font-weight: bold;
-            margin: 5px; 
-            padding: 15px; 
-            border: 2px solid #4CAF50; 
-            border-radius: 8px; 
-            background-color: #f1f8e9; 
-            white-space: pre-wrap;
+            font-size: 24px; margin: 6px; padding: 20px;
+            border: 2px solid #7B3294; border-radius: 8px;
+            background-color: #F3EEF8; white-space: pre-wrap;
         """)
-        self.swi_label.setWordWrap(True)
-        self.swi_label.setMinimumWidth(400)
-        bottom_layout.addWidget(self.swi_label, stretch=2)
+        self.right_layout.addWidget(self.swi_label)
 
-        # Status label
-        self.status_label = QLabel("Current Status: Waiting for data import | Model loading...")
-        self.status_label.setStyleSheet("""
-            font-size: 18px; 
-            font-weight: bold;
-            margin: 5px; 
-            padding: 10px; 
-            border: 1px solid #eee; 
-            border-radius: 5px;
-        """)
-        self.status_label.setWordWrap(True)
-        bottom_layout.addWidget(self.status_label, stretch=1)
+        self.status_label = QLabel("Status: waiting for data import | loading model...")
+        self.status_label.setStyleSheet("font-size: 24px; margin: 6px; padding: 16px; border: 1px solid #eee; border-radius: 5px;")
+        self.right_layout.addWidget(self.status_label)
 
-        # Info label
-        self.info_label = QLabel("Tips:\n1. Supports importing TXT or SET format raw data\n2. Automatically extract N1/N2/N3 stage data via 'Import via Sleep Staging'\n3. Red areas can be clicked after detection: Confirm to turn green, Reject to remove\n4. Click 'Recalculate SWI' after adjustment to update indicators\n5. Click 'View Brain Topography' after spike detection to analyze spatial distribution")
-        self.info_label.setStyleSheet('''
-            font-size: 18px; 
-            font-weight: bold;
-            margin: 5px; 
-            padding: 15px; 
-            border: 2px solid #4CAF50; 
-            border-radius: 8px; 
-            background-color: #f1f8e9; 
-            white-space: pre-wrap;
-        ''')
-        self.info_label.setWordWrap(True)
-        bottom_layout.addWidget(self.info_label, stretch=3)
-
-        self.right_layout.addWidget(bottom_container)
+        self.info_label = QLabel("Tips:\n1. Raw TXT or SET data can be imported.\n2. Import by Sleep Stage can automatically extract N1/N2/N3 segments.\n3. After detection, click orange regions to confirm them as purple or reject them.\n4. Click Recalculate SWI after manual edits.\n5. Click View Spatial Distribution after detection to inspect spatial distribution.")
+        self.info_label.setStyleSheet('''font-size: 24px; margin: 6px; padding: 20px;
+            border: 2px solid #7B3294; border-radius: 8px;
+            background-color: #F3EEF8; white-space: pre-wrap;
+            ''')
+        self.right_layout.addWidget(self.info_label)
 
         self.right_panel.setWidget(self.right_content)
         self.right_panel.setWidgetResizable(True)
         main_layout.addWidget(self.right_panel, stretch=4)
 
-    def show_brain_topography(self):
-        if self.process_step != 3 or not self.window_center_times or not self.window_pred_map:
-            QMessageBox.warning(self, "Conditions Not Met", "Please complete spike detection first to ensure window prediction results exist!")
+    def format_duration(self, seconds):
+        if seconds is None or pd.isna(seconds):
+            return ""
+        seconds = max(0, int(round(float(seconds))))
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    def load_long_term_record_df(self):
+        if os.path.exists(LONG_TERM_RECORD_CSV):
+            try:
+                df = pd.read_csv(LONG_TERM_RECORD_CSV, dtype=str, encoding="utf-8-sig")
+            except UnicodeDecodeError:
+                df = pd.read_csv(LONG_TERM_RECORD_CSV, dtype=str, encoding="gbk")
+        else:
+            df = pd.DataFrame(columns=LONG_TERM_RECORD_COLUMNS)
+        for col in LONG_TERM_RECORD_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        df = df[LONG_TERM_RECORD_COLUMNS].fillna("")
+        for time_col, result_col in [
+            ("棘波检测用时", "棘波检测结果"),
+            ("手动修改核对用时", "手动修改棘波检测结果"),
+        ]:
+            path_mask = df[time_col].astype(str).apply(lambda value: ":\\\\" in value or value.startswith("\\\\\\\\"))
+            empty_result_mask = df[result_col].astype(str).str.strip().eq("")
+            move_mask = path_mask & empty_result_mask
+            df.loc[move_mask, result_col] = df.loc[move_mask, time_col]
+            df.loc[path_mask, time_col] = ""
+        return df
+
+    def save_long_term_record_df(self, df):
+        os.makedirs(os.path.dirname(LONG_TERM_RECORD_CSV), exist_ok=True)
+        df = df[LONG_TERM_RECORD_COLUMNS].fillna("")
+        try:
+            df.to_csv(LONG_TERM_RECORD_CSV, index=False, encoding="utf-8-sig")
+        except PermissionError:
+            QMessageBox.warning(
+                self,
+                "Record File In Use",
+                f"Could not write the long-term annotation record. It may be open in Excel/WPS.\nPlease close it and retry:\n{LONG_TERM_RECORD_CSV}"
+            )
+
+    def ensure_subject_id(self):
+        if not self.file_path:
+            return None
+        filename = os.path.basename(self.file_path)
+        filename_match = re.match(r"^(S\d{3})(?:[_\-.]|$)", filename, re.IGNORECASE)
+        if filename_match:
+            self.subject_id = filename_match.group(1).upper()
+            return self.subject_id
+
+        df = self.load_long_term_record_df()
+        file_path_norm = os.path.normcase(os.path.abspath(self.file_path))
+        for _, row in df.iterrows():
+            old_path = str(row.get("对应原始数据", ""))
+            if old_path and os.path.normcase(os.path.abspath(old_path)) == file_path_norm:
+                self.subject_id = str(row.get("编号", "")).strip()
+                return self.subject_id
+
+        used = set(str(x).strip() for x in df["编号"].tolist() if str(x).strip())
+        idx = 1
+        while f"S{idx:03d}" in used:
+            idx += 1
+        self.subject_id = f"S{idx:03d}"
+        return self.subject_id
+
+    def update_long_term_record(self, **updates):
+        if not self.file_path:
             return
-        
+        subject_id = self.ensure_subject_id()
+        if not subject_id:
+            return
+        df = self.load_long_term_record_df()
+        if subject_id in df["编号"].astype(str).tolist():
+            row_idx = df.index[df["编号"].astype(str) == subject_id][0]
+        else:
+            row_idx = len(df)
+            df.loc[row_idx, LONG_TERM_RECORD_COLUMNS] = ""
+            df.at[row_idx, "编号"] = subject_id
+
+        source_path = os.path.abspath(self.file_path)
+        existing_source_path = str(df.at[row_idx, "对应原始数据"]).strip()
+        defaults = {
+            "总记录时长": self.format_duration(self.original_total_duration_sec),
+            "可分析时长": self.format_duration(self.analyzable_duration_sec),
+            "被排除时长": self.format_duration(self.excluded_duration_sec),
+        }
+        if not existing_source_path:
+            defaults["对应原始数据"] = source_path
+        elif os.path.normcase(os.path.abspath(existing_source_path)) == os.path.normcase(source_path):
+            defaults["对应原始数据"] = source_path
+        defaults.update(updates)
+        for col, value in defaults.items():
+            if col in LONG_TERM_RECORD_COLUMNS and value not in (None, ""):
+                df.at[row_idx, col] = str(value)
+        self.save_long_term_record_df(df)
+
+    def get_result_path(self, root_dir, suffix):
+        subject_id = self.ensure_subject_id() or "S000"
+        subject_dir = os.path.join(root_dir, subject_id)
+        os.makedirs(subject_dir, exist_ok=True)
+        return os.path.join(subject_dir, f"{subject_id}_{suffix}.npz")
+
+    def get_autosave_subject_key(self):
+        subject_id = self.ensure_subject_id()
+        if subject_id:
+            return subject_id
+        if self.last_loaded_spike_path:
+            stem = os.path.splitext(os.path.basename(self.last_loaded_spike_path))[0]
+            match = re.match(r"(S\d{3})_", stem, re.IGNORECASE)
+            return match.group(1).upper() if match else stem
+        if self.file_path:
+            return re.sub(r"[^0-9A-Za-z_-]+", "_", os.path.splitext(os.path.basename(self.file_path))[0])
+        if self.total_samples and self.fs:
+            return f"unknown_{int(round(float(self.fs)))}hz_{int(self.total_samples)}samples"
+        return None
+
+    def get_autosave_label_path(self):
+        key = self.get_autosave_subject_key()
+        if not key:
+            return None
+        safe_key = re.sub(r"[^0-9A-Za-z_-]+", "_", str(key))
+        return os.path.join(AUTOSAVE_LABEL_DIR, f"{safe_key}_autosave.json")
+
+    def save_spike_label_autosave(self, reason="manual_edit"):
+        if self.current_data is None or not self.total_samples:
+            return
+        autosave_path = self.get_autosave_label_path()
+        if not autosave_path:
+            return
+        payload = {
+            "version": 1,
+            "reason": reason,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "subject_id": self.get_autosave_subject_key(),
+            "source_file_path": os.path.abspath(self.file_path) if self.file_path else "",
+            "loaded_spike_result_path": os.path.abspath(self.last_loaded_spike_path) if self.last_loaded_spike_path else "",
+            "fs": float(self.fs),
+            "total_samples": int(self.total_samples),
+            "high_prob_spikes": [[float(t), float(prob)] for t, prob in self.high_prob_spikes],
+            "low_prob_spikes": [[float(t), float(prob)] for t, prob in self.low_prob_spikes],
+        }
+        try:
+            os.makedirs(AUTOSAVE_LABEL_DIR, exist_ok=True)
+            tmp_path = autosave_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, autosave_path)
+        except Exception as e:
+            self.status_label.setText(f"Status: autosave draft failed: {str(e)}")
+
+    def clear_spike_label_autosave(self):
+        autosave_path = self.get_autosave_label_path()
+        if autosave_path and os.path.exists(autosave_path):
+            try:
+                os.remove(autosave_path)
+            except OSError:
+                pass
+
+    def find_matching_spike_label_autosave(self):
+        if self.current_data is None or not self.total_samples:
+            return None, None
+        candidates = []
+        direct_path = self.get_autosave_label_path()
+        if direct_path:
+            candidates.append(direct_path)
+        if os.path.isdir(AUTOSAVE_LABEL_DIR):
+            for name in os.listdir(AUTOSAVE_LABEL_DIR):
+                if name.endswith("_autosave.json"):
+                    path = os.path.join(AUTOSAVE_LABEL_DIR, name)
+                    if path not in candidates:
+                        candidates.append(path)
+
+        current_source = os.path.normcase(os.path.abspath(self.file_path)) if self.file_path else ""
+        current_subject = self.get_autosave_subject_key()
+        matches = []
+        for path in candidates:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                if int(payload.get("total_samples", -1)) != int(self.total_samples):
+                    continue
+                if abs(float(payload.get("fs", -1)) - float(self.fs)) > 1e-6:
+                    continue
+                saved_subject = str(payload.get("subject_id", "")).strip()
+                if current_subject and saved_subject and saved_subject != current_subject:
+                    continue
+                saved_source = str(payload.get("source_file_path", "")).strip()
+                if current_source and saved_source and os.path.normcase(os.path.abspath(saved_source)) != current_source:
+                    continue
+                matches.append((os.path.getmtime(path), path, payload))
+            except Exception:
+                continue
+        if not matches:
+            return None, None
+        _, path, payload = max(matches, key=lambda x: x[0])
+        return path, payload
+
+    def maybe_restore_spike_label_autosave(self):
+        autosave_path, payload = self.find_matching_spike_label_autosave()
+        if not payload:
+            return False
+        high_count = len(payload.get("high_prob_spikes", []))
+        low_count = len(payload.get("low_prob_spikes", []))
+        saved_at = payload.get("saved_at", "unknown time")
+        reply = QMessageBox.question(
+            self,
+            "Unsaved Draft Found",
+            f"Found an unsaved label draft from the previous session:\nSaved at: {saved_at}\nPurple labels: {high_count}, orange labels: {low_count}\n\nRestore this draft?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+        if reply != QMessageBox.Yes:
+            return False
+
+        self.high_prob_spikes = [(float(t), float(prob)) for t, prob in payload.get("high_prob_spikes", [])]
+        self.low_prob_spikes = [(float(t), float(prob)) for t, prob in payload.get("low_prob_spikes", [])]
+        self.high_prob_spikes.sort(key=lambda x: x[0])
+        self.low_prob_spikes.sort(key=lambda x: x[0])
+        self.selected_spike_times.clear()
+        self.current_annotation_nav_index = None
+        if self.window_pred_map:
+            for key in list(self.window_pred_map.keys()):
+                self.window_pred_map[key] = 0
+            for spike_time, _ in self.high_prob_spikes + self.low_prob_spikes:
+                nearest_time = min(self.window_center_times, key=lambda t: abs(t - spike_time)) if self.window_center_times else None
+                if nearest_time is not None:
+                    self.window_pred_map[nearest_time] = 1
+        self.process_step = 3
+        self.save_spike_btn.setEnabled(True)
+        self.recalc_swi_btn.setEnabled(True)
+        self.plot_brain_btn.setEnabled(True)
+        self.recalculate_swi()
+        self.update_plot_by_slider(self.time_slider.value())
+        self.status_label.setText(
+            f"Status: restored unsaved draft | purple {len(self.high_prob_spikes)}, orange {len(self.low_prob_spikes)}"
+        )
+        return True
+
+    def save_current_spikes_to_path(self, save_path, show_dialog=True):
+        all_spike_times = [t for t, _ in self.high_prob_spikes] + [t for t, _ in self.low_prob_spikes]
+        if self.current_data is None:
+            QMessageBox.warning(self, "Save Failed", "No EEG data available to save.")
+            return None
+        return save_spike_data(
+            all_spike_times,
+            self.current_data,
+            self.fs,
+            save_path=save_path,
+            show_dialog=show_dialog,
+            parent=self,
+            high_prob_spikes=self.high_prob_spikes,
+            low_prob_spikes=self.low_prob_spikes,
+            total_record_duration=getattr(self, "original_total_duration_sec", None),
+            analyzable_duration=getattr(self, "analyzable_duration_sec", None),
+            excluded_duration=getattr(self, "excluded_duration_sec", None),
+            spike_detection_elapsed=getattr(self, "last_detection_elapsed_sec", None),
+            source_file_path=getattr(self, "eeg_source_path", None),
+            source_intervals=getattr(self, "eeg_source_intervals", []),
+            source_invert=getattr(self, "eeg_source_invert", False),
+            source_channel_names=self.channel_names[:self.current_data.shape[0]]
+        )
+
+    def start_manual_correction_timer(self):
+        if self.current_data is None:
+            QMessageBox.warning(self, "Cannot Start", "Please import or load EEG data first.")
+            return
+        if self.manual_correction_running:
+            return
+        self.ensure_subject_id()
+        self.manual_correction_started_at = time.time()
+        self.manual_correction_running = True
+        self.manual_correction_start_btn.setEnabled(False)
+        self.manual_correction_pause_btn.setEnabled(True)
+        self.manual_correction_end_btn.setEnabled(True)
+        self.status_label.setText("Status: manual review timer running")
+
+    def pause_manual_correction_timer(self):
+        if not self.manual_correction_running:
+            return
+        self.manual_correction_elapsed_sec += time.time() - self.manual_correction_started_at
+        self.manual_correction_started_at = None
+        self.manual_correction_running = False
+        self.manual_correction_start_btn.setText("Resume Review Timer")
+        self.manual_correction_start_btn.setEnabled(True)
+        self.manual_correction_pause_btn.setEnabled(False)
+        self.manual_correction_end_btn.setEnabled(True)
+        elapsed = self.format_duration(self.manual_correction_elapsed_sec)
+        self.status_label.setText(f"Status: manual review timer paused | elapsed {elapsed}")
+
+    def end_manual_correction_timer(self):
+        if self.manual_correction_running:
+            self.manual_correction_elapsed_sec += time.time() - self.manual_correction_started_at
+            self.manual_correction_started_at = None
+            self.manual_correction_running = False
+        elapsed = self.format_duration(self.manual_correction_elapsed_sec)
+        save_path = self.get_result_path(MANUAL_CORRECTION_RESULT_DIR, "manual_correction")
+        saved_path = self.save_current_spikes_to_path(save_path, show_dialog=False)
+        if not saved_path:
+            return
+        self.update_long_term_record(
+            **{
+                "手动修改核对用时": elapsed,
+                "手动修改棘波检测结果": saved_path,
+            }
+        )
+        self.manual_correction_start_btn.setText("Start Review Timer")
+        self.manual_correction_start_btn.setEnabled(True)
+        self.manual_correction_pause_btn.setEnabled(False)
+        self.manual_correction_end_btn.setEnabled(False)
+        QMessageBox.information(
+            self,
+            "Manual Review Saved",
+            f"Manual review elapsed time: {elapsed}\nResults saved to:\n{saved_path}\n\nRecord updated:\n{LONG_TERM_RECORD_CSV}"
+        )
+        self.status_label.setText(f"Status: manual review complete | elapsed {elapsed}")
+        self.manual_correction_elapsed_sec = 0.0
+        self.manual_correction_started_at = None
+        self.manual_correction_running = False
+        self.clear_spike_label_autosave()
+    # 显示脑地形图和电极定位图（核心修改）
+    def show_brain_topography(self):
+        """显示电极定位叠加在脑地形图上的合并图"""
+        if self.process_step != 3 or not self.window_center_times or not self.window_pred_map:
+            QMessageBox.warning(self, "Requirements Not Met", "Please finish spike detection first and make sure window predictions are available.")
+            return
+
         target_channels = ['T3', 'T4', 'C3', 'C4', 'P3', 'P4', 'T5', 'T6']
-        
+
+        # 计算通道比例
         try:
             channel_ratios, _ = calculate_high_pred1_ratios(
                 raw_data=self.current_data,
@@ -388,169 +2014,502 @@ class EEGAutoSaveProcessor(QMainWindow):
                 std_coeff=0.5
             )
         except Exception as e:
-            QMessageBox.critical(self, "Statistics Failed", f"Error calculating ratios: {str(e)}")
+            QMessageBox.critical(self, "Statistics Failed", f"Error while calculating ratios: {str(e)}")
             return
-        
+
         channel_counts = {ch: {'true_ratio': ratio} for ch, ratio in channel_ratios.items()}
-        
-        brain_fig = plot_brain_topography(
+
+        # 绘制“定位叠在地形图上”的合并图
+        combined_fig = plot_brain_with_electrodes(
             raw_data=self.current_data,
             channel_names=self.channel_names,
             target_channels=target_channels,
             channel_counts=channel_counts,
             sfreq=self.fs
         )
-        brain_dialog = QDialog(self)
-        brain_dialog.setWindowTitle("Brain Topography")
-        brain_dialog.setGeometry(100, 100, 800, 700)
-        brain_layout = QVBoxLayout(brain_dialog)
-        brain_canvas = FigureCanvas(brain_fig)
-        brain_layout.addWidget(brain_canvas)
-        brain_btn = QDialogButtonBox(QDialogButtonBox.Close)
-        brain_btn.rejected.connect(brain_dialog.close)
-        brain_layout.addWidget(brain_btn)
-        
-        montage_fig = plot_electrode_montage(
-            raw_data=self.current_data,
-            channel_names=self.channel_names,
-            target_channels=target_channels,
-            channel_counts=channel_counts,
-            sfreq=self.fs
-        )
-        montage_dialog = QDialog(self)
-        montage_dialog.setWindowTitle("Electrode Montage")
-        montage_dialog.setGeometry(950, 100, 800, 700)
-        montage_layout = QVBoxLayout(montage_dialog)
-        montage_canvas = FigureCanvas(montage_fig)
-        montage_layout.addWidget(montage_canvas)
-        montage_btn = QDialogButtonBox(QDialogButtonBox.Close)
-        montage_btn.rejected.connect(montage_dialog.close)
-        montage_layout.addWidget(montage_btn)
-        
-        brain_dialog.show()
-        montage_dialog.show()
+
+        # 弹窗显示结果
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Channel-Level Spatial Distribution")
+        dialog.setGeometry(200, 100, 800, 800)  # 正方形窗口适配圆形脑图
+        layout = QVBoxLayout(dialog)
+        canvas = FigureCanvas(combined_fig)
+        layout.addWidget(canvas)
+        btn = QDialogButtonBox(QDialogButtonBox.Close)
+        close_button = btn.button(QDialogButtonBox.Close)
+        if close_button is not None:
+            close_button.setStyleSheet("font-size: 12px; padding: 4px 10px;")
+        btn.rejected.connect(dialog.close)
+        layout.addWidget(btn)
+        dialog.show()
 
     def import_data_by_sleep_stage(self):
         sleep_dialog = SleepStageImportDialog(self)
         if sleep_dialog.exec_() != QDialog.Accepted:
             return
-        
-        txt_file_path = sleep_dialog.txt_file_path
+
+        data_file_path = getattr(sleep_dialog, 'data_file_path', sleep_dialog.txt_file_path)
         start_row = sleep_dialog.selected_start_row
         end_row = sleep_dialog.selected_end_row
+        start_time = getattr(sleep_dialog, 'selected_start_time', None)
+        end_time = getattr(sleep_dialog, 'selected_end_time', None)
         total_rows = sleep_dialog.total_rows
+        sleep_intervals = getattr(sleep_dialog, 'sleep_intervals', [])
         self.fs = sleep_dialog.fs
-        
+        self.samples_per_window = int(self.window_duration * self.fs)
+        file_ext = os.path.splitext(data_file_path)[1].lower()
+
         try:
-            all_lines = []
-            with open(txt_file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                for line_num, line in enumerate(f, start=1):
-                    if start_row <= line_num <= end_row:
-                        line = line.strip()
-                        if line:
-                            all_lines.append(line)
-            
-            if not all_lines:
-                raise ValueError(f"No valid data in selected row range ({start_row}-{end_row} rows)")
-            
-            data_list = []
+            prepared_current_data = None
+            prepared_invert = False
+            prepared_is_normalized = False
+            messages = []
             over_16_count = 0
             invalid_count = 0
             over_16_samples = []
             invalid_samples = []
-            
-            for line_num, line in enumerate(all_lines, start=start_row):
-                values = [float(val) for val in line.replace(',', ' ').split()]
-                if len(values) > 16:
-                    over_16_count += 1
-                    over_16_samples.append(line_num)
-                    values = values[:16]
-                elif len(values) != 16:
-                    invalid_count += 1
-                    invalid_samples.append(line_num)
-                    continue
-                data_list.append(values)
-            
-            data_np = np.array(data_list).T
-            if data_np.shape[0] != 16:
-                raise ValueError(f"Incorrect total channel count (16 required, {data_np.shape[0]} found)")
-            
-            info = mne.create_info(
-                ch_names=self.channel_names,
-                sfreq=self.fs,
-                ch_types=['eeg']*16
+
+            if file_ext == ".txt":
+                interval_rows = []
+                for seg_start, seg_end, seg_stage in sleep_intervals:
+                    row_start = max(1, int(((sleep_dialog.base_offset or 0) + seg_start) * self.fs) + 1)
+                    row_end = max(row_start, int(((sleep_dialog.base_offset or 0) + seg_end) * self.fs))
+                    interval_rows.append((row_start, row_end, seg_stage))
+                txt_size_gb = os.path.getsize(data_file_path) / (1024 ** 3)
+                import_progress = QProgressDialog(
+                    f"Reading {os.path.basename(data_file_path)} ({txt_size_gb:.2f} GB)...\n"
+                    "The first import normally takes about 15-30 seconds.",
+                    None,
+                    0,
+                    0,
+                    self,
+                )
+                import_progress.setWindowTitle("Importing TXT Data")
+                import_progress.setWindowModality(Qt.WindowModal)
+                import_progress.setMinimumDuration(0)
+                import_progress.setAutoClose(False)
+                import_progress.show()
+                self.status_label.setText(
+                    f"Status: reading {os.path.basename(data_file_path)} in background | model loaded"
+                )
+                QApplication.processEvents()
+                try:
+                    # Keep the Qt event loop responsive while the large, one-time
+                    # disk scan and the parallel pandas parsers run off the GUI thread.
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as import_executor:
+                        import_future = import_executor.submit(
+                            read_txt_intervals_fast,
+                            data_file_path,
+                            interval_rows,
+                            16,
+                        )
+                        while not import_future.done():
+                            QApplication.processEvents()
+                            time.sleep(0.03)
+                        data_np, invalid_count, header_rows = import_future.result()
+                finally:
+                    import_progress.close()
+                    QApplication.processEvents()
+                if data_np.shape[1] == 0:
+                    raise ValueError("No valid TXT data were found within the N1/N2/N3 segment range.")
+                if data_np.shape[0] != 16:
+                    raise ValueError(f"Invalid channel count: expected 16, got {data_np.shape[0]}.")
+
+                # Keep the one-time TXT extraction in memory only.  A separate
+                # copy is normalized for display; the raw float32 data is kept
+                # until Run Preprocessing exports its temporary SET file.
+                self.txt_raw_data = data_np
+                self.raw = None
+                prepared_current_data = np.array(data_np, dtype=np.float32, copy=True)
+                prepared_invert = False
+                prepared_is_normalized = False
+                range_text = (
+                    f"Merged N1/N2/N3 segments: {len(sleep_intervals)} segments, "
+                    f"{data_np.shape[1]} rows (fast indexed TXT reader, header rows: {header_rows})"
+                )
+                next_step_text = "Next step: click Run Preprocessing"
+                self.process_step = 1
+                self.preprocess_btn.setEnabled(True)
+                self.spike_detect_btn.setEnabled(False)
+            elif file_ext in (".edf", ".set", ".fdt"):
+                data_file_path = resolve_eeg_file_path(data_file_path)
+                file_ext = os.path.splitext(data_file_path)[1].lower()
+                # Reuse the header object opened in the selection dialog.  Large
+                # EEGLAB SET headers can otherwise be parsed twice.
+                raw_full = getattr(sleep_dialog, "raw_header", None)
+                if raw_full is None:
+                    raw_full = read_supported_eeg(data_file_path, preload=False, verbose=False)
+
+                def norm_ch(name):
+                    text = re.sub(r'[^A-Z0-9]', '', str(name).upper())
+                    for token in ('EEG', 'REF', 'LE', 'AVG'):
+                        text = text.replace(token, '')
+                    return text
+
+                available = {norm_ch(ch): ch for ch in raw_full.ch_names}
+                picks = []
+                missing = []
+                for wanted in self.channel_names:
+                    wanted_norm = norm_ch(wanted)
+                    if wanted_norm in available:
+                        picks.append(available[wanted_norm])
+                    else:
+                        match = next((ch for ch in raw_full.ch_names if wanted_norm in norm_ch(ch)), None)
+                        if match:
+                            picks.append(match)
+                        else:
+                            missing.append(wanted)
+                if missing:
+                    raise ValueError(f"Missing channels in EDF: {', '.join(missing)}")
+
+                raw_full.pick_channels(picks, ordered=True)
+                rename_map = {old: new for old, new in zip(picks, self.channel_names) if old != new}
+                if rename_map:
+                    raw_full.rename_channels(rename_map)
+
+                raw_fs = float(raw_full.info['sfreq'])
+                total_duration = raw_full.n_times / raw_fs
+                segment_specs = []
+                kept_intervals = []
+                for seg_start, seg_end, seg_stage in sleep_intervals:
+                    tmin = max(0.0, float(seg_start))
+                    tmax = min(total_duration, float(seg_end))
+                    if tmax <= tmin:
+                        continue
+                    start_sample = max(0, int(round(tmin * raw_fs)))
+                    end_sample = min(raw_full.n_times, int(round(tmax * raw_fs)))
+                    if end_sample <= start_sample:
+                        continue
+                    segment_specs.append((start_sample, end_sample))
+                    kept_intervals.append((tmin, tmax, seg_stage))
+                if not segment_specs:
+                    raise ValueError("No valid EDF data were found within the N1/N2/N3 segment range.")
+
+                # Allocate the final float32 array once and stream directly into
+                # it.  This avoids retaining all float64 segments, concatenating
+                # them, wrapping them in RawArray, and copying them out again.
+                total_kept_samples = sum(end - start for start, end in segment_specs)
+                data_np = np.empty((len(picks), total_kept_samples), dtype=np.float32)
+                # Ten-minute chunks are a good balance for long EEGLAB FDT files:
+                # roughly 38 MB temporary float64 data for 16 channels at 500 Hz.
+                chunk_samples = max(1, int(raw_fs * 600.0))
+                write_pos = 0
+                for start_sample, end_sample in segment_specs:
+                    for chunk_start in range(start_sample, end_sample, chunk_samples):
+                        chunk_end = min(end_sample, chunk_start + chunk_samples)
+                        block = raw_full.get_data(start=chunk_start, stop=chunk_end)
+                        block_len = chunk_end - chunk_start
+                        data_np[:, write_pos:write_pos + block_len] = block
+                        write_pos += block_len
+                prepared_current_data = data_np
+                prepared_invert = True
+                prepared_is_normalized = False
+                self.txt_raw_data = None
+                self.raw = None
+                self.fs = raw_fs
+                self.samples_per_window = int(self.window_duration * self.fs)
+                total_kept_sec = data_np.shape[1] / self.fs
+                range_text = f"Merged N1/N2/N3 segments: {len(kept_intervals)} segments, {total_kept_sec:.2f} s"
+                next_step_text = "Next step: click Detect Spikes"
+                self.process_step = 2
+                self.preprocess_btn.setEnabled(False)
+                self.spike_detect_btn.setEnabled(True if self.model is not None else False)
+            else:
+                raise ValueError(f"Unsupported format: {file_ext} (TXT/EDF/SET only)")
+
+            self.file_path = data_file_path
+            self.eeg_source_path = data_file_path
+            self.eeg_source_intervals = (
+                [(float(start), float(end)) for start, end, _ in kept_intervals]
+                if file_ext in (".edf", ".set") else []
             )
-            self.raw = mne.io.RawArray(data_np, info)
-            self.file_path = txt_file_path
-            
-            self.current_data = self.raw.get_data()
-            self.current_data = (self.current_data - np.mean(self.current_data, axis=1, keepdims=True)) / \
-                                (np.std(self.current_data, axis=1, keepdims=True) + 1e-6)
-            
-            self.process_step = 1
+            self.eeg_source_invert = file_ext in (".edf", ".set")
+            self.last_loaded_spike_path = None
+            if prepared_current_data is not None:
+                if prepared_is_normalized:
+                    self.current_data = prepared_current_data
+                else:
+                    self.current_data = normalize_eeg_float32(
+                        prepared_current_data,
+                        invert=prepared_invert,
+                    )
+            else:
+                self.current_data = normalize_eeg_float32(self.raw.get_data(), invert=False)
+
             self.total_samples = self.current_data.shape[1]
+            self.analyzable_duration_sec = self.total_samples / self.fs if self.fs else None
+            self.original_total_duration_sec = total_rows / self.fs if total_rows and self.fs else self.analyzable_duration_sec
+            self.excluded_duration_sec = (
+                max(0.0, self.original_total_duration_sec - self.analyzable_duration_sec)
+                if self.original_total_duration_sec is not None and self.analyzable_duration_sec is not None
+                else None
+            )
+            self.ensure_subject_id()
+            self.update_long_term_record()
+            self.last_detection_elapsed_sec = None
+            self.manual_correction_elapsed_sec = 0.0
+            self.manual_correction_started_at = None
+            self.manual_correction_running = False
+            self.manual_correction_start_btn.setText("Start Review Timer")
+            self.manual_correction_start_btn.setEnabled(True)
+            self.manual_correction_pause_btn.setEnabled(False)
+            self.manual_correction_end_btn.setEnabled(False)
             max_slider_value = max(0, self.total_samples - self.samples_per_window)
             self.time_slider.setMaximum(max_slider_value)
             self.time_slider.setEnabled(True)
-            
+
             self.high_prob_spikes.clear()
             self.low_prob_spikes.clear()
+            self.current_annotation_nav_index = None
             self.region_spike_map.clear()
             self.window_center_times.clear()
             self.window_pred_map.clear()
             self.swi_value = 0.0
             self.spike_seconds = 0
             self.total_seconds = 0
-            self.swi_label.setText("【Spike Wave Index (SWI) Indicators】\nWaiting for detection or result loading...")
+            self.swi_label.setText("Spike-Wave Index (SWI)\nWaiting for detection or loaded results...")
             self.save_spike_btn.setEnabled(False)
             self.recalc_swi_btn.setEnabled(False)
             self.plot_brain_btn.setEnabled(False)
-            
+
             self.update_plot_by_slider(0)
-            self.status_label.setText(f"Current Status: TXT data imported via sleep staging | Model loaded successfully")
+            file_type = "SET" if file_ext == ".set" else ("EDF" if file_ext == ".edf" else "TXT")
+            self.status_label.setText(f"Status: imported {file_type} data by sleep stage | model loaded")
             self.info_label.setText(
-                f"✅ Imported successfully via sleep staging!\n"
-                f"File: {os.path.basename(txt_file_path)}\n"
-                f"Selected range: {start_row} rows ~ {end_row} rows (total {len(all_lines)} rows)\n"
-                f"Channels: 16 | Sampling rate: {self.fs}Hz\n"
-                f"Total data duration: {self.total_samples/self.fs:.2f} seconds\n"
-                f"Next step: Click 'Run Preprocessing'"
+                f"Import by sleep stage succeeded.\n"
+                f"File: {os.path.basename(data_file_path)}\n"
+                f"{range_text}\n"
+                f"Channels: 16 | Sampling rate: {self.fs:g} Hz\n"
+                f"Data duration: {self.total_samples/self.fs:.2f} s\n"
+                f"{next_step_text}"
             )
-            self.preprocess_btn.setEnabled(True)
-            self.spike_detect_btn.setEnabled(False)
-            
-            messages = []
+
             if over_16_count > 0:
-                if over_16_count <= 5:
-                    rows_str = ", ".join(map(str, over_16_samples))
-                else:
-                    rows_str = ", ".join(map(str, over_16_samples[:5])) + f" and {over_16_count} other rows"
+                rows_str = ", ".join(map(str, over_16_samples[:5]))
+                if over_16_count > 5:
+                    rows_str += f" and {over_16_count} rows total"
                 messages.append(f"Detected {over_16_count} rows with more than 16 channels: {rows_str}")
-                messages.append("Automatically truncated to first 16 channels for analysis")
-            
+                messages.append("Only the first 16 channels were kept for analysis.")
+
             if invalid_count > 0:
-                if invalid_count <= 5:
-                    rows_str = ", ".join(map(str, invalid_samples))
+                if invalid_samples:
+                    rows_str = ", ".join(map(str, invalid_samples[:5]))
+                    if invalid_count > 5:
+                        rows_str += f" and {invalid_count} rows total"
                 else:
-                    rows_str = ", ".join(map(str, invalid_samples[:5])) + f" and {invalid_count} other rows"
-                messages.append(f"Found {invalid_count} rows with less than 16 channels: {rows_str}")
-                messages.append("These rows have been skipped and not included in analysis")
-            
+                    rows_str = "row numbers were not retained by the fast TXT reader"
+                messages.append(f"Found {invalid_count} rows with fewer than 16 channels: {rows_str}")
+                messages.append("These rows were skipped and excluded from analysis.")
+
             if messages:
                 icon = QMessageBox.Warning if invalid_count > 0 else QMessageBox.Information
-                QMessageBox(icon, "Data Processing Tip", "\n".join(messages), QMessageBox.Ok, self).exec_()
-        
+                QMessageBox(icon, "Data Processing Notice", "\n".join(messages), QMessageBox.Ok, self).exec_()
+
         except Exception as e:
-            QMessageBox.critical(self, "Sleep Staging Import Failed", f"Error: {str(e)}")
-            self.status_label.setText("Current Status: Sleep staging import failed | Model loaded successfully")
-            self.info_label.setText(f"❌ Error: {str(e)}")
+            QMessageBox.critical(self, "Sleep-Stage Import Failed", f"Error: {str(e)}")
+            self.status_label.setText("Status: sleep-stage import failed | model loaded")
+            self.info_label.setText(f"Error: {str(e)}")
+
+
+
+    def eventFilter(self, obj, event):
+        if obj is self.plot_widget.viewport() and event.type() == QEvent.Wheel:
+            if self.current_data is None or not self.time_slider.isEnabled():
+                return True
+
+            angle_delta = event.angleDelta()
+            horizontal = angle_delta.x()
+            vertical = angle_delta.y()
+            if horizontal == 0 and vertical == 0:
+                pixel_delta = event.pixelDelta()
+                horizontal = pixel_delta.x()
+                vertical = pixel_delta.y()
+
+            if abs(horizontal) > abs(vertical):
+                primary_delta = horizontal
+                direction = 1 if primary_delta > 0 else -1
+            else:
+                primary_delta = vertical
+                # Conventional vertical wheel: up = earlier/left, down = later/right.
+                direction = -1 if primary_delta > 0 else 1
+
+            if primary_delta != 0:
+                steps = max(1, int(round(abs(primary_delta) / 120.0)))
+                self.move_time_window(direction * steps)
+            event.accept()
+            return True
+        return super().eventFilter(obj, event)
+
+    def add_manual_spike_at_pending_time(self):
+        if self.current_data is None or self.total_samples == 0:
+            QMessageBox.warning(self, "Cannot Add", "Please import or load EEG data first.")
+            return
+
+        if self.pending_manual_spike_time is None:
+            QMessageBox.information(self, "No Position Selected", "Click a blank waveform location first, then press A to add the spike.")
+            return
+
+        spike_time = self.pending_manual_spike_time
+        self.pending_manual_spike_time = None
+        self.add_manual_spike(spike_time)
+
+    def move_time_window(self, direction):
+        if self.current_data is None or not self.time_slider.isEnabled():
+            return
+        step = int(round(self.window_duration * self.fs))
+        target = self.time_slider.value() + int(direction) * step
+        target = max(self.time_slider.minimum(), min(target, self.time_slider.maximum()))
+        self.time_slider.setValue(target)
+        self.plot_widget.setFocus()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Plus or event.key() == Qt.Key_Equal:
-            self.zoom_y_axis(scale_factor=1.2)
+            self.adjust_amplitude_scale(0.2)
         elif event.key() == Qt.Key_Minus:
-            self.zoom_y_axis(scale_factor=0.8)
-        super().keyPressEvent(event)
+            self.adjust_amplitude_scale(-0.2)
+        elif event.key() == Qt.Key_Left:
+            self.move_time_window(-1)
+            event.accept()
+        elif event.key() == Qt.Key_Right:
+            self.move_time_window(1)
+            event.accept()
+        elif event.key() == Qt.Key_Down:
+            self.reject_current_annotation()
+            event.accept()
+        elif event.key() == Qt.Key_Up:
+            self.confirm_current_annotation()
+            event.accept()
+        elif event.key() == Qt.Key_A:
+            self.add_manual_spike_at_pending_time()
+            event.accept()
+        elif event.key() == Qt.Key_Delete:
+            self.delete_selected_spikes()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+    def adjust_amplitude_scale(self, delta):
+        self.amplitude_scale = max(0.1, min(10.0, self.amplitude_scale + float(delta)))
+        if hasattr(self, 'amp_scale_label'):
+            self.amp_scale_label.setText(f"{self.amplitude_scale:.1f}x")
+        if self.current_data is not None:
+            self.update_plot_by_slider(self.time_slider.value())
+            self.plot_widget.setFocus()
+
+    def reset_amplitude_scale(self):
+        self.amplitude_scale = 1.0
+        if hasattr(self, 'amp_scale_label'):
+            self.amp_scale_label.setText(f"{self.amplitude_scale:.1f}x")
+        if self.current_data is not None:
+            self.update_plot_by_slider(self.time_slider.value())
+            self.plot_widget.setFocus()
+
+    def get_prediction_annotation_times(self):
+        times = [float(t) for t, _ in self.high_prob_spikes] + [float(t) for t, _ in self.low_prob_spikes]
+        return sorted(set(round(t, 3) for t in times))
+
+    def jump_to_prediction_annotation(self, direction):
+        annotation_times = self.get_prediction_annotation_times()
+        if not annotation_times or self.current_data is None:
+            return
+
+        if not hasattr(self, 'current_annotation_nav_index'):
+            self.current_annotation_nav_index = None
+
+        if self.current_annotation_nav_index is None or self.current_annotation_nav_index >= len(annotation_times):
+            current_center = self.time_slider.value() / self.fs + self.window_duration / 2
+            self.current_annotation_nav_index = min(
+                range(len(annotation_times)),
+                key=lambda i: abs(annotation_times[i] - current_center)
+            )
+        else:
+            self.current_annotation_nav_index = (self.current_annotation_nav_index + direction) % len(annotation_times)
+
+        target_time = annotation_times[self.current_annotation_nav_index]
+        target_start = int((target_time - self.window_duration / 2) * self.fs)
+        target_start = max(0, min(target_start, self.time_slider.maximum()))
+        self.time_slider.setValue(target_start)
+        self.update_plot_by_slider(target_start)
+        self.plot_widget.setFocus()
+
+
+
+    def get_current_annotation_time(self):
+        annotation_times = self.get_prediction_annotation_times()
+        if not annotation_times or self.current_data is None:
+            return None
+
+        if (
+            self.current_annotation_nav_index is None
+            or self.current_annotation_nav_index >= len(annotation_times)
+        ):
+            current_center = self.time_slider.value() / self.fs + self.window_duration / 2
+            self.current_annotation_nav_index = min(
+                range(len(annotation_times)),
+                key=lambda i: abs(annotation_times[i] - current_center)
+            )
+
+        return annotation_times[self.current_annotation_nav_index]
+
+    def remove_annotation_at_time(self, spike_time):
+        removed = False
+        for spike_list in (self.high_prob_spikes, self.low_prob_spikes):
+            for i, (t, prob) in enumerate(list(spike_list)):
+                if abs(float(t) - float(spike_time)) <= 0.05:
+                    del spike_list[i]
+                    removed = True
+                    break
+            if removed:
+                break
+
+        if not removed:
+            return False
+
+        self.selected_spike_times.discard(self._spike_key(spike_time))
+        self.current_annotation_nav_index = None
+        self.update_plot_by_slider(self.time_slider.value())
+        self.recalculate_swi()
+        self.status_label.setText(
+            f"Status: rejected/deleted annotation at {spike_time:.3f} s | purple {len(self.high_prob_spikes)}, orange {len(self.low_prob_spikes)}"
+        )
+        self.save_spike_label_autosave("remove_annotation")
+        return True
+
+    def confirm_annotation_at_time(self, spike_time):
+        for i, (t, prob) in enumerate(list(self.low_prob_spikes)):
+            if abs(float(t) - float(spike_time)) <= 0.05:
+                del self.low_prob_spikes[i]
+                self.high_prob_spikes.append((float(t), float(prob)))
+                self.high_prob_spikes.sort(key=lambda x: x[0])
+                self.current_annotation_nav_index = None
+                self.update_plot_by_slider(self.time_slider.value())
+                self.recalculate_swi()
+                self.status_label.setText(
+                    f"Status: converted annotation at {spike_time:.3f} s to purple | purple {len(self.high_prob_spikes)}, orange {len(self.low_prob_spikes)}"
+                )
+                self.save_spike_label_autosave("confirm_annotation")
+                return True
+
+        for t, prob in self.high_prob_spikes:
+            if abs(float(t) - float(spike_time)) <= 0.05:
+                self.status_label.setText(f"Status: {spike_time:.3f} s is already a purple annotation")
+                return True
+
+        return False
+
+    def reject_current_annotation(self):
+        spike_time = self.get_current_annotation_time()
+        if spike_time is None:
+            QMessageBox.information(self, "No Annotation", "There is no annotation available to reject.")
+            return
+        self.remove_annotation_at_time(spike_time)
+
+    def confirm_current_annotation(self):
+        spike_time = self.get_current_annotation_time()
+        if spike_time is None:
+            QMessageBox.information(self, "No Annotation", "There is no annotation available to convert to purple.")
+            return
+        self.confirm_annotation_at_time(spike_time)
 
     def zoom_y_axis(self, scale_factor):
         if self.plot_widget is None:
@@ -564,25 +2523,156 @@ class EEGAutoSaveProcessor(QMainWindow):
         self.plot_widget.setYRange(new_y_min, new_y_max, padding=0)
         self.current_y_scale *= scale_factor
         scaled_unit = self.original_y_unit_scale * self.current_y_scale
-        self.plot_widget.setLabel('left', f'Amplitude (μV × {scaled_unit:.2f})')
+        self.plot_widget.setLabel('left', '')
 
-    def on_plot_click(self, event):
-        if self.process_step != 3:
-            return
-        
+
+    def _spike_key(self, spike_time):
+        return round(float(spike_time), 3)
+
+    def _find_spike_at_plot_time(self, click_x):
         for region, spike_time in self.region_spike_map.items():
             region_x = region.getRegion()
-            click_x = self.plot_widget.plotItem.vb.mapSceneToView(event.scenePos()).x()
-            
-            if region_x[0] <= click_x <= region_x[1] and region.brush.color().red() == 255:
-                dialog = SpikeConfirmDialog(spike_time, self)
-                result = dialog.exec_()
-                
-                if result == QDialog.Accepted:
-                    self.confirm_low_spike(spike_time)
-                else:
-                    self.reject_low_spike(spike_time)
-                break
+            if region_x[0] <= click_x <= region_x[1]:
+                return float(spike_time)
+        return None
+
+    def _toggle_selected_spike(self, spike_time):
+        key = self._spike_key(spike_time)
+        if key in self.selected_spike_times:
+            self.selected_spike_times.remove(key)
+        else:
+            self.selected_spike_times.add(key)
+        self.pending_manual_spike_time = None
+        self.update_plot_by_slider(self.time_slider.value())
+        self.status_label.setText(
+            f"Status: selected {len(self.selected_spike_times)} labels | right-click or press Delete to remove; click blank space then press A to add"
+        )
+
+    def _set_pending_manual_spike(self, spike_time):
+        total_duration = self.total_samples / self.fs if self.fs else 0
+        self.pending_manual_spike_time = round(max(0.0, min(float(spike_time), total_duration)), 3)
+        self.update_plot_by_slider(self.time_slider.value())
+        self.status_label.setText(
+            f"Status: pending add at {self.pending_manual_spike_time:.3f} s | press A to add a purple label"
+        )
+
+    def delete_selected_spikes(self):
+        if not self.selected_spike_times:
+            QMessageBox.information(self, "No Selected Labels", "Please click one or more orange/purple label regions first.")
+            return
+
+        selected_keys = set(self.selected_spike_times)
+
+        def keep_unselected(spike):
+            return self._spike_key(spike[0]) not in selected_keys
+
+        old_high = len(self.high_prob_spikes)
+        old_low = len(self.low_prob_spikes)
+        self.high_prob_spikes = [s for s in self.high_prob_spikes if keep_unselected(s)]
+        self.low_prob_spikes = [s for s in self.low_prob_spikes if keep_unselected(s)]
+        deleted_count = (old_high - len(self.high_prob_spikes)) + (old_low - len(self.low_prob_spikes))
+
+        if deleted_count == 0:
+            self.selected_spike_times.clear()
+            self.update_plot_by_slider(self.time_slider.value())
+            self.status_label.setText("Status: selected labels no longer exist")
+            return
+
+        self.selected_spike_times.clear()
+        self.current_annotation_nav_index = None
+        self.recalculate_swi()
+        self.update_plot_by_slider(self.time_slider.value())
+        self.status_label.setText(
+            f"Status: deleted {deleted_count} labels | purple {len(self.high_prob_spikes)}, orange {len(self.low_prob_spikes)}"
+        )
+        self.save_spike_label_autosave("delete_selected")
+
+    def show_spike_context_menu(self, event, click_x):
+        clicked_spike = self._find_spike_at_plot_time(click_x)
+        if clicked_spike is not None and self._spike_key(clicked_spike) not in self.selected_spike_times:
+            self.selected_spike_times.add(self._spike_key(clicked_spike))
+            self.update_plot_by_slider(self.time_slider.value())
+
+        menu = QMenu(self)
+        delete_action = menu.addAction(f"Delete Selected Labels ({len(self.selected_spike_times)})")
+        delete_action.setEnabled(bool(self.selected_spike_times))
+        chosen = menu.exec_(event.globalPos())
+        if chosen == delete_action:
+            self.delete_selected_spikes()
+
+    def on_plot_mouse_press(self, event):
+        if event.button() == Qt.RightButton:
+            scene_pos = self.plot_widget.mapToScene(event.pos())
+            click_x = self.plot_widget.plotItem.vb.mapSceneToView(scene_pos).x()
+            self.show_spike_context_menu(event, click_x)
+            event.accept()
+            return
+
+        self._original_plot_mouse_press_event(event)
+
+    def on_plot_click(self, event):
+        click_x = self.plot_widget.plotItem.vb.mapSceneToView(event.scenePos()).x()
+
+        if self.process_step != 3:
+            return
+
+        if event.button() == Qt.LeftButton:
+            clicked_spike = self._find_spike_at_plot_time(click_x)
+            if clicked_spike is not None:
+                self._toggle_selected_spike(clicked_spike)
+            else:
+                self._set_pending_manual_spike(click_x)
+            return
+
+    def toggle_manual_label_mode(self):
+        self.status_label.setText("Status: manual label mode active. Click a blank waveform location, then press A to confirm.")
+        self.plot_widget.setFocus()
+    def add_manual_spike(self, spike_time):
+        if self.current_data is None or self.total_samples == 0:
+            QMessageBox.warning(self, "Cannot Add", "Please import or load EEG data first.")
+            return
+
+        total_duration = self.total_samples / self.fs
+        spike_time = round(max(0.0, min(float(spike_time), total_duration)), 3)
+        existing_times = [float(t) for t, _ in self.high_prob_spikes] + [float(t) for t, _ in self.low_prob_spikes]
+        if any(abs(spike_time - t) <= 0.05 for t in existing_times):
+            QMessageBox.information(self, "Already Exists", f"An annotation already exists near {spike_time:.3f} s.")
+            return
+
+        self.high_prob_spikes.append((spike_time, 1.0))
+        self.high_prob_spikes.sort(key=lambda x: x[0])
+        self.selected_spike_times.clear()
+        annotation_times = self.get_prediction_annotation_times()
+        self.current_annotation_nav_index = annotation_times.index(spike_time) if spike_time in annotation_times else None
+
+        if self.window_center_times:
+            nearest_time = min(self.window_center_times, key=lambda t: abs(t - spike_time))
+            self.window_pred_map[nearest_time] = 1
+
+        self.update_plot_by_slider(self.time_slider.value())
+        self.save_spike_btn.setEnabled(True)
+        self.recalc_swi_btn.setEnabled(True)
+        self.plot_brain_btn.setEnabled(True)
+        all_spike_times = [t for t, _ in self.high_prob_spikes] + [t for t, _ in self.low_prob_spikes]
+        self.swi_value, self.spike_seconds, self.total_seconds = calculate_swi(all_spike_times, total_duration)
+        self.swi_label.setText(
+            f"Spike-Wave Index (SWI)\n"
+            f"1. SWI: {self.swi_value}%\n"
+            f"2. High-probability spikes: {len(self.high_prob_spikes)}\n"
+            f"3. Low-probability spikes: {len(self.low_prob_spikes)}\n"
+            f"4. Seconds containing spikes: {self.spike_seconds} s\n"
+            f"5. Total seconds: {self.total_seconds} s\n"
+            f"6. Original duration: {total_duration:.2f} s"
+        )
+        self.status_label.setText(
+            f"Status: manually added purple annotation at {spike_time:.3f} s | purple {len(self.high_prob_spikes)}, orange {len(self.low_prob_spikes)}"
+        )
+        self.info_label.setText(
+            f"Manually added purple annotation: {spike_time:.3f} s\n"
+            f"Purple annotations: {len(self.high_prob_spikes)} | orange annotations: {len(self.low_prob_spikes)}\n"
+            f"Click a blank waveform location to choose another position, then press A to add it; click existing purple/orange labels to multi-select and delete."
+        )
+        self.save_spike_label_autosave("add_manual")
 
     def confirm_low_spike(self, spike_time):
         for i, (t, prob) in enumerate(self.low_prob_spikes):
@@ -592,13 +2682,14 @@ class EEGAutoSaveProcessor(QMainWindow):
                 break
         else:
             return
-        
+
         self.high_prob_spikes.append(confirmed_spike)
         self.high_prob_spikes.sort(key=lambda x: x[0])
-        
+
         self.update_plot_by_slider(self.time_slider.value())
-        
-        QMessageBox.information(self, "Operation Successful", f"Confirmed spike at {spike_time:.3f} seconds, turned to green region")
+        self.save_spike_label_autosave("confirm_low_spike")
+
+        QMessageBox.information(self, "Done", f"Confirmed the spike at {spike_time:.3f} s and changed it to a purple region.")
 
     def reject_low_spike(self, spike_time):
         for i, (t, prob) in enumerate(self.low_prob_spikes):
@@ -607,35 +2698,36 @@ class EEGAutoSaveProcessor(QMainWindow):
                 break
         else:
             return
-        
+
         self.update_plot_by_slider(self.time_slider.value())
-        
-        QMessageBox.information(self, "Operation Successful", f"Rejected spike at {spike_time:.3f} seconds, removed red region")
+        self.save_spike_label_autosave("reject_low_spike")
+
+        QMessageBox.information(self, "Done", f"Rejected the spike at {spike_time:.3f} s and removed the orange region.")
 
     def recalculate_swi(self):
         if self.total_samples == 0:
-            QMessageBox.warning(self, "Calculation Failed", "No data available to calculate SWI!")
+            QMessageBox.warning(self, "Calculation Failed", "No data available for SWI calculation.")
             return
-        
+
         all_spike_times = [t for t, _ in self.high_prob_spikes] + [t for t, _ in self.low_prob_spikes]
         total_duration = self.total_samples / self.fs
-        
+
         self.swi_value, self.spike_seconds, self.total_seconds = calculate_swi(
             all_spike_times, total_duration
         )
-        
+
         self.swi_label.setText(
-            f"【Spike Wave Index (SWI) Indicators】\n"
-            f"1. SWI value: {self.swi_value}%\n"
-            f"2. Total high-probability spikes: {len(self.high_prob_spikes)}\n"
-            f"3. Total low-probability spikes: {len(self.low_prob_spikes)}\n"
-            f"4. Seconds with spikes: {self.spike_seconds} seconds\n"
-            f"5. Total data seconds: {self.total_seconds} seconds\n"
-            f"6. Original data duration: {total_duration:.2f} seconds"
+            f"Spike-Wave Index (SWI)\n"
+            f"1. SWI: {self.swi_value}%\n"
+            f"2. High-probability spikes: {len(self.high_prob_spikes)}\n"
+            f"3. Low-probability spikes: {len(self.low_prob_spikes)}\n"
+            f"4. Seconds containing spikes: {self.spike_seconds} s\n"
+            f"5. Total seconds: {self.total_seconds} s\n"
+            f"6. Original duration: {total_duration:.2f} s"
         )
-        
+
         self.status_label.setText(
-            f"Current Status: SWI recalculated | {len(self.high_prob_spikes)} high-probability spikes, {len(self.low_prob_spikes)} low-probability spikes"
+            f"Status: SWI recalculated | high-probability spikes {len(self.high_prob_spikes)}, low-probability spikes {len(self.low_prob_spikes)}"
         )
 
     def init_model(self):
@@ -645,38 +2737,39 @@ class EEGAutoSaveProcessor(QMainWindow):
                 time_steps=self.input_window_size,
                 num_classes=2
             ).to(self.device)
-            
-            checkpoint = torch.load(self.model_weight_path, map_location=self.device)
+
+            checkpoint = torch.load(self.model_weight_path, map_location=self.device, weights_only=True)
             if "module." in list(checkpoint.keys())[0]:
                 checkpoint = {k.replace("module.", ""): v for k, v in checkpoint.items()}
             self.model.load_state_dict(checkpoint)
-            
+
             self.model.eval()
-            self.status_label.setText("Current Status: Waiting for data import | Model loaded successfully")
-            
+            self.status_label.setText("Status: waiting for data import | model loaded")
+
         except FileNotFoundError:
-            QMessageBox.critical(self, "Model Loading Failed", f"Weights file not found!\nPath: {self.model_weight_path}")
-            self.status_label.setText("Current Status: Waiting for data import | Model loading failed (missing weights)")
+            QMessageBox.critical(self, "Model Load Failed", f"Weight file not found.\nPath: {self.model_weight_path}")
+            self.status_label.setText("Status: waiting for data import | model load failed (missing weights)")
             self.spike_detect_btn.setEnabled(False)
-            
+
         except Exception as e:
-            QMessageBox.critical(self, "Model Loading Failed", f"Error: {str(e)}\nPossible mismatch between weights and model structure")
-            self.status_label.setText("Current Status: Waiting for data import | Model loading failed (structure mismatch)")
+            QMessageBox.critical(self, "Model Load Failed", f"Error: {str(e)}\nThe weights may not match the model architecture.")
+            self.status_label.setText("Status: waiting for data import | model load failed (architecture mismatch)")
             self.spike_detect_btn.setEnabled(False)
 
     def import_raw_data(self):
-        from PyQt5.QtWidgets import QFileDialog
+        self.txt_raw_data = None
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Raw EEG Data (TXT/SET)", os.getcwd(), "EEG Files (*.txt *.set);;All Files (*.*)"
+            self, "Select Raw EEG Data (TXT/SET)", os.getcwd(), "EEG files (*.txt *.set);;All files (*.*)"
         )
-        
+
         if not file_path or not os.path.exists(file_path):
-            QMessageBox.warning(self, "Tip", "No valid file selected or file does not exist!")
+            QMessageBox.warning(self, "Tip", "No valid file was selected, or the file does not exist.")
             return
-        
+
         try:
             file_ext = os.path.splitext(file_path)[1].lower()
             if file_ext == ".txt":
+                warm_up_matlab_engine_async()
                 all_lines = []
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                     for line in f:
@@ -685,7 +2778,7 @@ class EEGAutoSaveProcessor(QMainWindow):
                             all_lines.append(line)
                 total_rows = len(all_lines)
                 if total_rows == 0:
-                    raise ValueError("TXT file is empty, no valid data")
+                    raise ValueError("TXT file is empty; no valid data were found.")
 
                 dialog = TimeRowRangeDialog(
                     total_rows=total_rows,
@@ -694,18 +2787,18 @@ class EEGAutoSaveProcessor(QMainWindow):
                 )
                 if dialog.exec_() != QDialog.Accepted:
                     return
-                
+
                 row_start = dialog.selected_start_row
                 row_end = dialog.selected_end_row
 
                 data_list = []
                 selected_lines = all_lines[row_start - 1:row_end]
-                
+
                 over_16_count = 0
                 invalid_count = 0
                 over_16_samples = []
                 invalid_samples = []
-                
+
                 for line_num, line in enumerate(selected_lines, start=row_start):
                     values = [float(val) for val in line.replace(',', ' ').split()]
                     if len(values) > 16:
@@ -717,29 +2810,29 @@ class EEGAutoSaveProcessor(QMainWindow):
                         invalid_samples.append(line_num)
                         continue
                     data_list.append(values)
-                
+
                 messages = []
                 if over_16_count > 0:
                     if over_16_count <= 5:
                         rows_str = ", ".join(map(str, over_16_samples))
                     else:
-                        rows_str = ", ".join(map(str, over_16_samples[:5])) + f" and {over_16_count} other rows"
+                        rows_str = ", ".join(map(str, over_16_samples[:5])) + f" and {over_16_count} rows total"
                     messages.append(f"Detected {over_16_count} rows with more than 16 channels: {rows_str}")
-                    messages.append("Automatically truncated to first 16 channels for analysis")
-                
+                    messages.append("Only the first 16 channels were kept for analysis.")
+
                 if invalid_count > 0:
                     if invalid_count <= 5:
                         rows_str = ", ".join(map(str, invalid_samples))
                     else:
-                        rows_str = ", ".join(map(str, invalid_samples[:5])) + f" and {invalid_count} other rows"
-                    messages.append(f"Found {invalid_count} rows with less than 16 channels: {rows_str}")
-                    messages.append("These rows have been skipped and not included in analysis")
-                
+                        rows_str = ", ".join(map(str, invalid_samples[:5])) + f" and {invalid_count} rows total"
+                    messages.append(f"Found {invalid_count} rows with fewer than 16 channels: {rows_str}")
+                    messages.append("These rows were skipped and excluded from analysis.")
+
                 if messages:
                     icon = QMessageBox.Warning if invalid_count > 0 else QMessageBox.Information
                     QMessageBox(
                         icon,
-                        "Data Processing Tip",
+                        "Data Processing Notice",
                         "\n".join(messages),
                         QMessageBox.Ok,
                         self
@@ -750,12 +2843,12 @@ class EEGAutoSaveProcessor(QMainWindow):
                     data_np = data_np[:16, :]
                     QMessageBox.information(
                         self,
-                        "Data Processing Tip",
-                        "Total channels exceed 16, automatically truncated to first 16 channels",
+                        "Data Processing Notice",
+                        "The total channel count is greater than 16. Only the first 16 channels were kept.",
                         QMessageBox.Ok
                     )
                 elif data_np.shape[0] != 16:
-                    raise ValueError(f"Incorrect total channel count (16 required, {data_np.shape[0]} found)")
+                    raise ValueError(f"Invalid channel count: expected 16, got {data_np.shape[0]}.")
 
                 info = mne.create_info(
                     ch_names=self.channel_names,
@@ -767,395 +2860,700 @@ class EEGAutoSaveProcessor(QMainWindow):
             elif file_ext == ".set":
                 self.raw = mne.io.read_raw_eeglab(file_path, preload=True)
             else:
-                raise ValueError(f"Unsupported format: {file_ext} (only TXT/SET supported)")
-            
+                raise ValueError(f"Unsupported format: {file_ext} (TXT/SET only)")
+
             self.current_data = self.raw.get_data()
             self.current_data = (self.current_data - np.mean(self.current_data, axis=1, keepdims=True)) / \
                                 (np.std(self.current_data, axis=1, keepdims=True) + 1e-6)
-            
+
             self.process_step = 1
             self.total_samples = self.current_data.shape[1]
             max_slider_value = max(0, self.total_samples - self.samples_per_window)
             self.time_slider.setMaximum(max_slider_value)
             self.time_slider.setEnabled(True)
-            
+
             self.update_plot_by_slider(0)
             self.file_path = file_path
-            
+            self.eeg_source_path = file_path
+            self.eeg_source_intervals = []
+            self.eeg_source_invert = False
+            self.last_loaded_spike_path = None
+
             self.high_prob_spikes.clear()
             self.low_prob_spikes.clear()
+            self.current_annotation_nav_index = None
             self.region_spike_map.clear()
             self.window_center_times.clear()
-            self.window_pred_map.clear()
+            self.window_pred_map.clear()  # 重置预测映射
             self.swi_value = 0.0
             self.spike_seconds = 0
             self.total_seconds = 0
-            self.swi_label.setText("【Spike Wave Index (SWI) Indicators】\nWaiting for detection or result loading...")
+            self.swi_label.setText("Spike-Wave Index (SWI)\nWaiting for detection or loaded results...")
             self.save_spike_btn.setEnabled(False)
             self.recalc_swi_btn.setEnabled(False)
             self.plot_brain_btn.setEnabled(False)
-            
+
             file_type = "TXT" if file_ext == ".txt" else "SET"
-            self.status_label.setText(f"Current Status: {file_type} raw data imported | Model loaded successfully")
+            self.status_label.setText(f"Status: imported raw {file_type} data | model loaded")
             self.info_label.setText(
-                f"✅ {file_type} raw data imported successfully!\n"
+                f"Raw {file_type} data imported successfully.\n"
                 f"File: {os.path.basename(file_path)}\n"
-                f"Channels: 16 | Sampling rate: {self.fs}Hz\n"
-                f"Total data duration: {self.total_samples/self.fs:.2f} seconds\n"
-                f"Next step: Click 'Run Preprocessing'"
+                f"Channels: 16 | Sampling rate: {self.fs} Hz\n"
+                f"Data duration: {self.total_samples/self.fs:.2f} s\n"
+                f"Next step: click Run Preprocessing"
             )
             self.preprocess_btn.setEnabled(True)
             self.spike_detect_btn.setEnabled(False)
-            
+
         except Exception as e:
             QMessageBox.critical(self, "Import Failed", f"Error reading raw file:\n{str(e)}")
-            self.status_label.setText(f"Current Status: {file_type} raw data import failed | Model loaded successfully")
-            self.info_label.setText(f"❌ Error: {str(e)}")
-            
+            self.status_label.setText("Status: raw data import failed | model loaded")
+            self.info_label.setText(f"Error: {str(e)}")
+
     def import_processed_data(self):
-        from PyQt5.QtWidgets import QFileDialog
+        self.txt_raw_data = None
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Preprocessed EEG Data (.set)", os.getcwd(), "EEG Files (*.set);;All Files (*.*)"
+            self, "Select Preprocessed EEG Data (.set)", os.getcwd(), "EEG files (*.set);;All files (*.*)"
         )
-        
+
         if not file_path or not os.path.exists(file_path):
-            QMessageBox.warning(self, "Tip", "No valid file selected or file does not exist!")
+            QMessageBox.warning(self, "Tip", "No valid file was selected, or the file does not exist.")
             return
-        
+
         try:
             self.raw = mne.io.read_raw_eeglab(file_path, preload=True)
             self.current_data = self.raw.get_data()
             self.current_data = (self.current_data - np.mean(self.current_data, axis=1, keepdims=True)) / \
                                 (np.std(self.current_data, axis=1, keepdims=True) + 1e-6)
-            
+
             self.process_step = 2
+            self.file_path = file_path
+            self.eeg_source_path = file_path
+            self.eeg_source_intervals = []
+            self.eeg_source_invert = False
+            self.last_loaded_spike_path = None
             self.total_samples = self.current_data.shape[1]
             max_slider_value = max(0, self.total_samples - self.samples_per_window)
             self.time_slider.setMaximum(max_slider_value)
             self.time_slider.setEnabled(True)
-            
+
             self.update_plot_by_slider(0)
-            
+
             self.high_prob_spikes.clear()
             self.low_prob_spikes.clear()
+            self.current_annotation_nav_index = None
             self.region_spike_map.clear()
             self.window_center_times.clear()
-            self.window_pred_map.clear()
+            self.window_pred_map.clear()  # 重置预测映射
             self.swi_value = 0.0
             self.spike_seconds = 0
             self.total_seconds = 0
-            self.swi_label.setText("【Spike Wave Index (SWI) Indicators】\nWaiting for detection or result loading...")
+            self.swi_label.setText("Spike-Wave Index (SWI)\nWaiting for detection or loaded results...")
             self.save_spike_btn.setEnabled(False)
             self.recalc_swi_btn.setEnabled(False)
             self.plot_brain_btn.setEnabled(False)
-            
-            self.status_label.setText("Current Status: Preprocessed data imported | Model loaded successfully")
+
+            self.status_label.setText("Status: imported preprocessed data | model loaded")
             self.info_label.setText(
-                f"✅ Preprocessed data imported successfully!\n"
+                f"Preprocessed data imported successfully.\n"
                 f"File: {os.path.basename(file_path)}\n"
-                f"Channels: 16 | Sampling rate: {self.fs}Hz\n"
-                f"Total data duration: {self.total_samples/self.fs:.2f} seconds\n"
-                f"Next step: Click 'Spike Detection'"
+                f"Channels: 16 | Sampling rate: {self.fs} Hz\n"
+                f"Data duration: {self.total_samples/self.fs:.2f} s\n"
+                f"Next step: click Detect Spikes"
             )
             self.preprocess_btn.setEnabled(False)
             self.spike_detect_btn.setEnabled(True if self.model is not None else False)
-            
+
         except Exception as e:
             QMessageBox.critical(self, "Import Failed", f"Error reading preprocessed file:\n{str(e)}")
-            self.status_label.setText("Current Status: Preprocessed data import failed | Model loaded successfully")
-            self.info_label.setText(f"❌ Error: {str(e)}")
+            self.status_label.setText("Status: preprocessed data import failed | model loaded")
+            self.info_label.setText(f"Error: {str(e)}")
 
     def run_preprocessing(self):
-        if self.process_step != 1 or self.raw is None:
-            QMessageBox.warning(self, "Preprocessing Conditions Not Met", "Please import raw data first!")
+        if self.process_step != 1 or not self.file_path:
+            QMessageBox.warning(self, "Tip", "Please import raw data first.")
             return
 
+        progress = QProgressDialog("Calling MATLAB for preprocessing...", "Cancel", 0, 4, self)
+        progress.setWindowTitle("MATLAB Preprocessing")
+        progress.setWindowModality(2)
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        def run_matlab_preprocess_responsive(file_path, fs, save_dir):
+            """Run the blocking MATLAB Engine call without freezing the Qt GUI."""
+            progress.setRange(0, 0)
+            QApplication.processEvents()
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as matlab_executor:
+                    matlab_future = matlab_executor.submit(
+                        call_matlab_preprocess,
+                        file_path,
+                        fs,
+                        save_dir,
+                    )
+                    while not matlab_future.done():
+                        QApplication.processEvents()
+                        time.sleep(0.03)
+                    return matlab_future.result()
+            finally:
+                progress.setRange(0, 4)
+                QApplication.processEvents()
+
         try:
-            progress = QProgressDialog("Running MATLAB preprocessing...", "Cancel", 0, 100, self)
-            progress.setWindowTitle("Preprocessing Progress")
-            progress.setWindowModality(Qt.WindowModal)
-            progress.show()
-            progress.setValue(10)
+            progress.setValue(1)
+            progress.setLabelText("Step 1/4: preparing input data...")
+            QApplication.processEvents()
 
-            if self.file_path.lower().endswith('.txt'):
-                processed_set_path = call_matlab_preprocess(self.file_path, fs=self.fs)
-                progress.setValue(60)
-                self.raw = mne.io.read_raw_eeglab(processed_set_path, preload=True)
+            if os.path.splitext(self.file_path)[1].lower() == ".txt":
+                progress.setLabelText("Step 1/4: exporting temporary SET file...")
+                QApplication.processEvents()
+                temp_set_dir = os.path.join(INTERFACE_DATA_DIR, "temp_set")
+                os.makedirs(temp_set_dir, exist_ok=True)
+                temp_set_name = os.path.splitext(os.path.basename(self.file_path))[0] + "_temp.set"
+                temp_set_path = os.path.join(temp_set_dir, temp_set_name)
+
+                if self.raw is not None:
+                    raw_data = self.raw.get_data()
+                    info = self.raw.info
+                elif self.txt_raw_data is not None:
+                    raw_data = self.txt_raw_data
+                    info = mne.create_info(
+                        ch_names=self.channel_names,
+                        sfreq=self.fs,
+                        ch_types=['eeg'] * len(self.channel_names),
+                    )
+                else:
+                    raise RuntimeError("The imported raw TXT data are unavailable. Please import the TXT again.")
+                raw_data_negated = np.negative(np.asarray(raw_data, dtype=np.float32))
+                processed_raw = mne.io.RawArray(raw_data_negated, info)
+
+                mne.export.export_raw(temp_set_path, processed_raw, fmt='eeglab', overwrite=True)
+                self.txt_raw_data = None
+                del raw_data, raw_data_negated, processed_raw
+                progress.setValue(2)
+                progress.setLabelText(
+                    "Step 2/4: MATLAB ready; filtering..."
+                    if matlab_engine_is_ready()
+                    else "Step 2/4: waiting for background MATLAB startup, then filtering..."
+                )
+                QApplication.processEvents()
+                full_set_path = run_matlab_preprocess_responsive(
+                    temp_set_path,
+                    self.fs,
+                    os.path.join(INTERFACE_DATA_DIR, "filter"),
+                )
             else:
-                processed_set_path = self.file_path
+                progress.setValue(2)
+                progress.setLabelText(
+                    "Step 2/4: MATLAB ready; filtering..."
+                    if matlab_engine_is_ready()
+                    else "Step 2/4: starting MATLAB, then filtering..."
+                )
+                QApplication.processEvents()
+                full_set_path = run_matlab_preprocess_responsive(
+                    self.file_path,
+                    self.fs,
+                    os.path.join(INTERFACE_DATA_DIR, "filter"),
+                )
 
-            progress.setValue(80)
-            self.current_data = self.raw.get_data()
-            self.current_data = (self.current_data - np.mean(self.current_data, axis=1, keepdims=True)) / \
-                                (np.std(self.current_data, axis=1, keepdims=True) + 1e-6)
+            progress.setValue(3)
+            progress.setLabelText("Step 3/4: loading preprocessed data...")
+            QApplication.processEvents()
+
+            self.current_data, loaded_fs = _load_eeg_from_source(
+                full_set_path,
+                [],
+                False,
+                self.channel_names,
+                self.fs,
+            )
+            self.fs = loaded_fs
+            self.samples_per_window = int(self.window_duration * self.fs)
+            self.eeg_source_path = full_set_path
+            self.eeg_source_intervals = []
+            self.eeg_source_invert = False
+
+            progress.setValue(4)
+            progress.setLabelText("Step 4/4: preprocessing complete...")
+            QApplication.processEvents()
 
             self.process_step = 2
-            progress.setValue(100)
-            progress.close()
+            self.total_samples = self.current_data.shape[1]
+            max_slider_value = max(0, self.total_samples - self.samples_per_window)
+            self.time_slider.setMaximum(max_slider_value)
 
-            self.status_label.setText("Current Status: Preprocessing completed | Model loaded successfully")
-            self.info_label.setText(
-                f"✅ Preprocessing completed successfully!\n"
-                f"Processed file saved to: {processed_set_path}\n"
-                f"Channels: 16 | Sampling rate: {self.fs}Hz\n"
-                f"Total data duration: {self.total_samples/self.fs:.2f} seconds\n"
-                f"Next step: Click 'Spike Detection'"
-            )
-            self.preprocess_btn.setEnabled(False)
-            self.spike_detect_btn.setEnabled(True if self.model is not None else False)
-
-        except Exception as e:
-            QMessageBox.critical(self, "Preprocessing Failed", f"Error during preprocessing:\n{str(e)}")
-            self.status_label.setText("Current Status: Preprocessing failed | Model loaded successfully")
-            self.info_label.setText(f"❌ Preprocessing error: {str(e)}")
-
-    def run_spike_detection(self):
-        if self.process_step != 2 or self.model is None or self.current_data is None:
-            QMessageBox.warning(self, "Detection Conditions Not Met", "Please complete preprocessing and ensure model is loaded!")
-            return
-
-        try:
-            progress = QProgressDialog("Running spike detection...", "Cancel", 0, 100, self)
-            progress.setWindowTitle("Spike Detection Progress")
-            progress.setWindowModality(Qt.WindowModal)
-            progress.show()
-            progress.setValue(10)
+            self.update_plot_by_slider(0)
 
             self.high_prob_spikes.clear()
             self.low_prob_spikes.clear()
+            self.current_annotation_nav_index = None
             self.region_spike_map.clear()
             self.window_center_times.clear()
-            self.window_pred_map.clear()
+            self.window_pred_map.clear()  # 重置预测映射
+            self.swi_value = 0.0
+            self.spike_seconds = 0
+            self.total_seconds = 0
+            self.swi_label.setText("Spike-Wave Index (SWI)\nWaiting for detection or loaded results...")
+            self.save_spike_btn.setEnabled(False)
+            self.recalc_swi_btn.setEnabled(False)
+            self.plot_brain_btn.setEnabled(False)
 
-            total_samples = self.current_data.shape[1]
-            valid_windows = []
+            self.status_label.setText("Status: preprocessing complete | model loaded")
+            self.info_label.setText(
+                f"MATLAB preprocessing complete.\n"
+                f"File: {os.path.basename(full_set_path)}\n"
+                f"Data shape: {self.current_data.shape[0]} channels x {self.current_data.shape[1]} samples\n"
+                f"Next step: click Detect Spikes"
+            )
+            self.spike_detect_btn.setEnabled(True if self.model is not None else False)
 
-            progress.setValue(20)
-            for i in range(self.half_window, total_samples - self.half_window, self.input_window_size):
+        except Exception as e:
+            QMessageBox.critical(self, "MATLAB Preprocessing Failed", f"Error: {str(e)}")
+            self.status_label.setText("Status: preprocessing failed | model loaded")
+            self.info_label.setText(f"Error: {str(e)}")
+        finally:
+            progress.close()
+
+    def run_spike_detection(self):
+        if self.process_step != 2 or self.model is None:
+            QMessageBox.warning(self, "Requirements Not Met", "Please finish preprocessing and make sure the model loaded successfully.")
+            return
+
+        progress = QProgressDialog("Running spike detection...", "Cancel", 0, 100, self)
+        progress.setWindowTitle("Spike Detection")
+        progress.setWindowModality(2)
+        progress.setValue(0)
+        progress.setMinimumDuration(0)
+        detection_completed = False
+
+        try:
+            start_time = time.time()
+            data = self.current_data
+            n_channels, total_samples = data.shape
+
+            max_start = total_samples - self.input_window_size
+            if max_start <= 0:
+                raise Exception(f"Data length is shorter than {self.window_sec} s (at least {self.input_window_size} samples required).")
+
+            total_duration = total_samples / self.fs
+            temp_spikes = []
+            window_step = self.half_window
+            total_windows = len(range(0, max_start + 1, window_step))
+            prob_threshold = 0.8
+
+            # 重置窗口中心时间和预测映射
+            self.window_center_times = []
+            self.window_pred_map = {}
+
+            self.artefact_idx.clear()
+            if self.device.type == "cuda":
+                batch_size = INFERENCE_BATCH_SIZE
+            else:
+                batch_size = CPU_INFERENCE_BATCH_SIZE
+            batch_features = []
+            batch_times = []
+            batch_raw_times = []
+
+            def run_inference_batch():
+                if not batch_features:
+                    return
+                input_tensor = torch.tensor(np.stack(batch_features, axis=0), dtype=torch.float32).to(self.device)
+                with torch.inference_mode():
+                    output = self.model(input_tensor)
+                    probs = F.softmax(output, dim=1)[:, 1].detach().cpu().numpy()
+                    preds = torch.argmax(output, dim=1).detach().cpu().numpy()
+
+                for mid_time_rounded, mid_time, pred, prob in zip(batch_times, batch_raw_times, preds, probs):
+                    pred = int(pred)
+                    prob = float(prob)
+                    self.window_pred_map[mid_time_rounded] = pred
+                    if pred == 1:
+                        temp_spikes.append((round(mid_time, 3), round(prob, 3)))
+
+                batch_features.clear()
+                batch_times.clear()
+                batch_raw_times.clear()
+                QApplication.processEvents()
+
+            for idx, start in enumerate(range(0, max_start + 1, window_step)):
                 if progress.wasCanceled():
-                    raise InterruptedError("Spike detection canceled by user")
+                    raise Exception("Spike detection canceled by user")
 
-                window_data = self.current_data[:, i - self.half_window:i + self.half_window]
-                if np.isnan(window_data).any() or np.std(window_data) < 1e-6:
+                progress.setValue(int((idx / total_windows) * 100))
+                QApplication.processEvents()
+
+                end = start + self.input_window_size
+                seg = data[:, start:end]
+
+                seg_max_abs = np.max(np.abs(seg))
+                if seg_max_abs > self.artefact_threshold:
+                    self.artefact_idx.append(idx)
                     continue
 
-                features = extract_multi_channel_features(window_data)
-                features = np.expand_dims(features, axis=0)
-                features_tensor = torch.tensor(features, dtype=torch.float32).to(self.device)
+                # 记录窗口中心时间（用于后续脑地形图分析）
+                mid_time = (start + self.half_window) / self.fs
+                mid_time_rounded = round(mid_time, 3)
+                self.window_center_times.append(mid_time_rounded)
 
-                with torch.no_grad():
-                    output = self.model(features_tensor)
-                    pred_prob = F.softmax(output, dim=1)[:, 1].cpu().numpy()[0]
-                    window_center_time = i / self.fs
+                feat = extract_multi_channel_features(seg)
+                batch_features.append(feat)
+                batch_times.append(mid_time_rounded)
+                batch_raw_times.append(mid_time)
 
-                    valid_windows.append((window_center_time, pred_prob))
+                if len(batch_features) >= batch_size:
+                    run_inference_batch()
 
-                progress.setValue(min(20 + int((i / total_samples) * 70), 90))
+            run_inference_batch()
 
-            progress.setValue(90)
-            for window_center_time, pred_prob in valid_windows:
-                self.window_center_times.append(window_center_time)
-                self.window_pred_map[window_center_time] = 1 if pred_prob >= 0.5 else 0
+            def merge_spikes(spike_list):
+                if not spike_list:
+                    return []
+                sorted_spikes = sorted(spike_list, key=lambda x: x[0])
+                merged = [sorted_spikes[0]]
+                for t, prob in sorted_spikes[1:]:
+                    if t - merged[-1][0] < 0.1:
+                        avg_t = (merged[-1][0] + t) / 2
+                        avg_prob = (merged[-1][1] + prob) / 2
+                        merged[-1] = (round(avg_t, 3), round(avg_prob, 3))
+                    else:
+                        merged.append((t, prob))
+                return merged
 
-                if pred_prob >= 0.8:
-                    self.high_prob_spikes.append((window_center_time, pred_prob))
-                elif 0.5 <= pred_prob < 0.8:
-                    self.low_prob_spikes.append((window_center_time, pred_prob))
+            merged_spikes = merge_spikes(temp_spikes)
 
-            self.high_prob_spikes.sort(key=lambda x: x[0])
-            self.low_prob_spikes.sort(key=lambda x: x[0])
-            self.window_center_times.sort()
+            self.high_prob_spikes = [s for s in merged_spikes if s[1] >= prob_threshold]
+            self.low_prob_spikes = [s for s in merged_spikes if s[1] > 0.5 and s[1] < prob_threshold]
 
-            total_duration = self.total_samples / self.fs
+            all_spike_times = [t for t, _ in self.high_prob_spikes] + [t for t, _ in self.low_prob_spikes]
             self.swi_value, self.spike_seconds, self.total_seconds = calculate_swi(
-                [t for t, _ in self.high_prob_spikes] + [t for t, _ in self.low_prob_spikes],
-                total_duration
+                all_spike_times, total_duration
             )
 
-            self.swi_label.setText(
-                f"【Spike Wave Index (SWI) Indicators】\n"
-                f"1. SWI value: {self.swi_value}%\n"
-                f"2. Total high-probability spikes (≥0.8): {len(self.high_prob_spikes)}\n"
-                f"3. Total low-probability spikes (0.5-0.8): {len(self.low_prob_spikes)}\n"
-                f"4. Seconds with spikes: {self.spike_seconds} seconds\n"
-                f"5. Total data seconds: {self.total_seconds} seconds\n"
-                f"6. Original data duration: {total_duration:.2f} seconds"
+            self.process_step = 3
+            progress.setValue(100)
+            detection_time = time.time() - start_time
+            self.last_detection_elapsed_sec = detection_time
+            self.update_long_term_record(
+                **{
+                    "棘波检测用时": self.format_duration(detection_time),
+                }
             )
 
             self.update_plot_by_slider(self.time_slider.value())
-            progress.setValue(100)
-            progress.close()
-
-            self.process_step = 3
             self.status_label.setText(
-                f"Current Status: Spike detection completed | {len(self.high_prob_spikes)} high-probability, {len(self.low_prob_spikes)} low-probability spikes"
+                f"Status: spike detection complete | high-probability {len(self.high_prob_spikes)}, low-probability {len(self.low_prob_spikes)}"
             )
-            self.info_label.setText(
-                f"✅ Spike detection completed!\n"
-                f"Total detected spikes: {len(self.high_prob_spikes) + len(self.low_prob_spikes)}\n"
-                f"- High-probability (≥0.8): {len(self.high_prob_spikes)} (green regions)\n"
-                f"- Low-probability (0.5-0.8): {len(self.low_prob_spikes)} (red regions)\n"
-                f"Operations available:\n"
-                f"1. Click red regions to confirm/reject low-probability spikes\n"
-                f"2. Click 'Recalculate SWI' after adjustment\n"
-                f"3. Click 'Save Spike Results' to export data\n"
-                f"4. Click 'View Brain Topography' to analyze spatial distribution"
+
+            self.swi_label.setText(
+                f"Spike-Wave Index (SWI)\n"
+                f"1. SWI: {self.swi_value}%\n"
+                f"2. High-probability spikes: {len(self.high_prob_spikes)}\n"
+                f"3. Low-probability spikes: {len(self.low_prob_spikes)}\n"
+                f"4. Seconds containing spikes: {self.spike_seconds} s\n"
+                f"5. Total seconds: {self.total_seconds} s\n"
+                f"6. Original duration: {total_duration:.2f} s"
             )
-            self.recalc_swi_btn.setEnabled(True)
+
             self.save_spike_btn.setEnabled(True)
+            self.recalc_swi_btn.setEnabled(True)
             self.plot_brain_btn.setEnabled(True)
 
-        except InterruptedError:
-            self.status_label.setText("Current Status: Spike detection canceled by user | Model loaded successfully")
-            self.info_label.setText("⚠️ Spike detection was canceled, no results generated")
+            if self.artefact_idx:
+                artefact_count = len(self.artefact_idx)
+                self.info_label.setText(
+                    f"Spike detection complete.\n"
+                    f"Elapsed time: {self.seconds_to_hms(detection_time)}\n"
+                    f"Detection windows: {total_windows} | artefact windows: {artefact_count} (skipped)\n"
+                    f"Tip: click orange regions to confirm/reject; click Recalculate SWI after edits.\n"
+                    f"Click View Spatial Distribution to inspect spatial distribution."
+                )
+            else:
+                self.info_label.setText(
+                    f"Spike detection complete.\n"
+                    f"Elapsed time: {self.seconds_to_hms(detection_time)}\n"
+                    f"Detection windows: {total_windows} | no artefact windows detected\n"
+                    f"Tip: click orange regions to confirm/reject; click Recalculate SWI after edits.\n"
+                    f"Click View Spatial Distribution to inspect spatial distribution."
+                )
+            detection_completed = True
+
         except Exception as e:
-            QMessageBox.critical(self, "Spike Detection Failed", f"Error during spike detection:\n{str(e)}")
-            self.status_label.setText("Current Status: Spike detection failed | Model loaded successfully")
-            self.info_label.setText(f"❌ Detection error: {str(e)}")
+            if str(e) == "Spike detection canceled by user":
+                QMessageBox.information(self, "Detection Canceled", "Spike detection was canceled.")
+                self.status_label.setText("Status: spike detection canceled | model loaded")
+            else:
+                QMessageBox.critical(self, "Detection Failed", f"Error: {str(e)}")
+                self.status_label.setText("Status: spike detection failed | model loaded")
+            self.info_label.setText(f"Error: {str(e)}")
+            self.recalc_swi_btn.setEnabled(False)
+            self.plot_brain_btn.setEnabled(False)
+        finally:
+            progress.close()
+            if detection_completed:
+                self.maybe_restore_spike_label_autosave()
+
+    def seconds_to_hms(self, seconds):
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        seconds = int(seconds % 60)
+        if hours > 0:
+            return f"{hours}h {minutes}m {seconds}s"
+        else:
+            return f"{minutes}m {seconds}s"
+
+    def save_spike_click(self):
+        save_path = self.get_result_path(AUTO_RESULT_DIR, "spike_detection")
+        saved_path = self.save_current_spikes_to_path(save_path, show_dialog=False)
+        if not saved_path:
+            return
+        updates = {"棘波检测结果": saved_path}
+        if self.last_detection_elapsed_sec is not None:
+            updates["棘波检测用时"] = self.format_duration(self.last_detection_elapsed_sec)
+        self.update_long_term_record(**updates)
+        self.clear_spike_label_autosave()
+        QMessageBox.information(
+            self,
+            "Saved",
+            f"Spike detection results saved to:\n{saved_path}\n\nRecord updated:\n{LONG_TERM_RECORD_CSV}"
+        )
+
+
+    def load_spike_click(self):
+        self.txt_raw_data = None
+        spike_data = load_spike_data()
+        if not spike_data:
+            return
+
+        self.last_loaded_spike_path = spike_data.get("load_path")
+        loaded_source_path = spike_data.get("source_file_path")
+        if loaded_source_path:
+            self.file_path = loaded_source_path
+            self.eeg_source_path = loaded_source_path
+            self.eeg_source_intervals = spike_data.get("source_intervals", [])
+            self.eeg_source_invert = spike_data.get("source_invert", False)
+        else:
+            # A legacy result contains EEG samples but no reproducible source.
+            self.eeg_source_path = None
+            self.eeg_source_intervals = []
+            self.eeg_source_invert = False
+        if self.last_loaded_spike_path:
+            match = re.match(r"(S\d{3})_", os.path.basename(self.last_loaded_spike_path), re.IGNORECASE)
+            if match:
+                self.subject_id = match.group(1).upper()
+        self.high_prob_spikes = [tuple(x) for x in spike_data.get("high_prob_spikes", [])]
+        self.low_prob_spikes = [tuple(x) for x in spike_data.get("low_prob_spikes", [])]
+        if not self.high_prob_spikes and not self.low_prob_spikes:
+            self.high_prob_spikes = [(t, 1.0) for t in spike_data["spike_times"]]
+        self.high_prob_spikes.sort(key=lambda x: x[0])
+        self.low_prob_spikes.sort(key=lambda x: x[0])
+        self.current_annotation_nav_index = None
+        self.current_data = spike_data["eeg_data"]
+        self.fs = spike_data["fs"]
+        self.samples_per_window = int(self.window_duration * self.fs)
+        self.total_samples = self.current_data.shape[1]
+        total_duration = self.total_samples / self.fs
+
+        # 重新生成窗口中心时间和预测映射，用于SWI和脑图统计。
+        max_start = self.total_samples - self.input_window_size
+        self.window_center_times = []
+        self.window_pred_map = {}
+        if max_start > 0:
+            window_step = self.half_window
+            # Build all window labels at once.  The previous implementation did a
+            # Python scan over every spike for every window (O(windows * spikes));
+            # a long recording could therefore require billions of comparisons.
+            starts = np.arange(0, max_start + 1, window_step, dtype=np.int64)
+            center_times = np.round((starts + self.half_window) / self.fs, 3)
+            spike_times_sorted = np.sort(np.asarray(
+                [t for t, _ in self.high_prob_spikes] +
+                [t for t, _ in self.low_prob_spikes],
+                dtype=float
+            ))
+
+            if spike_times_sorted.size:
+                insert_at = np.searchsorted(spike_times_sorted, center_times, side="left")
+                nearest_distance = np.full(center_times.shape, np.inf, dtype=float)
+
+                has_right = insert_at < spike_times_sorted.size
+                nearest_distance[has_right] = np.abs(
+                    spike_times_sorted[insert_at[has_right]] - center_times[has_right]
+                )
+
+                has_left = insert_at > 0
+                nearest_distance[has_left] = np.minimum(
+                    nearest_distance[has_left],
+                    np.abs(spike_times_sorted[insert_at[has_left] - 1] - center_times[has_left])
+                )
+                window_predictions = (nearest_distance <= 0.5).astype(np.uint8)
+            else:
+                window_predictions = np.zeros(center_times.shape, dtype=np.uint8)
+
+            self.window_center_times = center_times.tolist()
+            self.window_pred_map = dict(zip(
+                self.window_center_times,
+                window_predictions.astype(int).tolist()
+            ))
+
+        all_spike_times = [t for t, _ in self.high_prob_spikes] + [t for t, _ in self.low_prob_spikes]
+        self.swi_value, self.spike_seconds, self.total_seconds = calculate_swi(
+            all_spike_times, total_duration
+        )
+
+        max_slider_value = max(0, self.total_samples - self.samples_per_window)
+        self.time_slider.setMaximum(max_slider_value)
+        self.time_slider.setEnabled(True)
+        self.update_plot_by_slider(0)
+        self.process_step = 3
+
+        self.status_label.setText(
+            f"Status: loaded spike results | purple {len(self.high_prob_spikes)}, orange {len(self.low_prob_spikes)}"
+        )
+        self.swi_label.setText(
+            f"Spike-Wave Index (SWI)\n"
+            f"1. SWI: {self.swi_value}%\n"
+            f"2. High-probability spikes: {len(self.high_prob_spikes)}\n"
+            f"3. Low-probability spikes: {len(self.low_prob_spikes)}\n"
+            f"4. Seconds containing spikes: {self.spike_seconds} s\n"
+            f"5. Total seconds: {self.total_seconds} s\n"
+            f"6. Original duration: {total_duration:.2f} s\n"
+            f"7. Save time: {spike_data['save_time']}"
+        )
+
+        self.save_spike_btn.setEnabled(True)
+        self.recalc_swi_btn.setEnabled(True)
+        self.plot_brain_btn.setEnabled(True)
+
+        self.info_label.setText(
+            f"Spike results loaded successfully.\n"
+            f"File save time: {spike_data['save_time']}\n"
+            f"Purple annotations: {len(self.high_prob_spikes)} | orange annotations: {len(self.low_prob_spikes)}\n"
+            f"Data shape: {self.current_data.shape[0]} channels x {self.current_data.shape[1]} samples\n"
+            f"Sampling rate: {self.fs} Hz\n"
+            f"Click View Spatial Distribution to inspect spatial distribution."
+        )
+        self.maybe_restore_spike_label_autosave()
+
 
     def update_plot_by_slider(self, slider_value):
         if self.current_data is None:
             return
-        
+
         start_sample = slider_value
         end_sample = start_sample + self.samples_per_window
         if end_sample > self.total_samples:
             end_sample = self.total_samples
             start_sample = max(0, end_sample - self.samples_per_window)
-        
+
         plot_data = self.current_data[:, start_sample:end_sample]
         times = np.arange(start_sample, end_sample) / self.fs
         window_start = round(times[0], 2) if len(times) > 0 else 0
         window_end = round(times[-1], 2) if len(times) > 0 else self.window_duration
-        
+
         self.plot_widget.clear()
+        if self.plot_legend is not None:
+            self.plot_legend.clear()
         self.region_spike_map.clear()
-        self.plot_widget.setTitle(f"EEG waveform | time range：{window_start}-{window_end}s (15s window)")
+        self.plot_widget.setTitle(f"EEG Waveform | Time Range: {window_start}-{window_end} s (15-second window) | Amplitude {self.amplitude_scale:.1f}x")
         self.plot_widget.setMouseEnabled(x=True, y=True)
-        
-        max_amplitude = np.max(np.abs(plot_data)) if plot_data.size > 0 else 1
-        offset = max_amplitude * 1.5
+
+        # Plot scaling only needs the visible 15-second window.  Scanning a
+        # multi-hour recording here made initial display and every slider move slow.
+        data_std = np.std(plot_data, dtype=np.float64) if plot_data.size > 0 else 1
+        if not np.isfinite(data_std) or data_std <= 0:
+            data_std = 1
+        offset = 5.0 * data_std
         highlight_channels = {4, 5, 12, 13}
-        
+        left_axis = self.plot_widget.getAxis('left')
+        left_axis.setWidth(72)
+        left_axis.setStyle(tickLength=0, tickTextOffset=8, tickFont=QFont("Arial", 16))
+        y_positions = [(plot_data.shape[0] - 1 - i) * offset for i in range(plot_data.shape[0])]
+        left_axis.setTicks([[tick for tick in zip(y_positions, self.channel_names[:plot_data.shape[0]])]])
+
         for i in range(plot_data.shape[0]):
-            channel_data = plot_data[i]
-            color = 'red' if i in highlight_channels else 'blue'
-            offset_data = channel_data + i * offset
-            
+            channel_data = plot_data[i] * self.amplitude_scale
+            color = '#7B3294' if i in highlight_channels else '#0072B2'
+            offset_data = channel_data + y_positions[i]
+
             self.plot_widget.plot(
                 times, offset_data,
                 label=self.channel_names[i],
                 pen=pg.mkPen(color=color, width=2)
             )
-            
-            if len(times) > 0 and len(offset_data) > 0:
-                text = TextItem(self.channel_names[i], anchor=(1, 0.5), color=(0, 0, 0))
-                text.setFont(QFont("Arial", 10))
-                text.setPos(times[0], offset_data[0])
-                self.plot_widget.addItem(text)
-        
+
         current_high_spikes = [s for s in self.high_prob_spikes if window_start <= s[0] <= window_end]
         for spike_time, _ in current_high_spikes:
+            selected = self._spike_key(spike_time) in self.selected_spike_times
             region = LinearRegionItem(
                 values=[spike_time - 0.1, spike_time + 0.1],
-                brush=pg.mkBrush(color=(0, 255, 0, 40)),
-                movable=False
-            )
-            self.plot_widget.addItem(region)
-            self.region_spike_map[region] = spike_time
-        
-        current_low_spikes = [s for s in self.low_prob_spikes if window_start <= s[0] <= window_end]
-        for spike_time, _ in current_low_spikes:
-            region = LinearRegionItem(
-                values=[spike_time - 0.1, spike_time + 0.1],
-                brush=pg.mkBrush(color=(255, 0, 0, 40)),
+                brush=pg.mkBrush(color=(123, 50, 148, 110 if selected else 48)),
                 movable=False
             )
             self.plot_widget.addItem(region)
             self.region_spike_map[region] = spike_time
 
+        current_low_spikes = [s for s in self.low_prob_spikes if window_start <= s[0] <= window_end]
+        for spike_time, _ in current_low_spikes:
+            selected = self._spike_key(spike_time) in self.selected_spike_times
+            region = LinearRegionItem(
+                values=[spike_time - 0.1, spike_time + 0.1],
+                brush=pg.mkBrush(color=(230, 159, 0, 110 if selected else 56)),
+                movable=False
+            )
+            self.plot_widget.addItem(region)
+            self.region_spike_map[region] = spike_time
+
+        if self.pending_manual_spike_time is not None and window_start <= self.pending_manual_spike_time <= window_end:
+            pending_line = pg.InfiniteLine(
+                pos=self.pending_manual_spike_time,
+                angle=90,
+                pen=pg.mkPen(color=(123, 50, 148), width=2, style=Qt.DashLine),
+                movable=False,
+            )
+            self.plot_widget.addItem(pending_line)
         if len(times) > 0:
             expected_end = times[0] + self.window_duration
             self.plot_widget.setXRange(times[0], expected_end, padding=0)
-        
+
         if plot_data.size > 0:
-            self.plot_widget.setYRange(-offset * 0.5, plot_data.shape[0] * offset + offset * 0.5)
+            self.plot_widget.setYRange(-offset * 1.2, (plot_data.shape[0] - 1) * offset + offset * 1.2)
             self.current_y_scale = 1.0
-            self.plot_widget.setLabel('left', 'Amplitude (μV)')
+            self.plot_widget.setLabel('left', '')
 
-        self.plot_widget.setLabel('bottom', 'Time ', 's', font=QFont("Arial", 12))
+        bottom_axis = self.plot_widget.getAxis('bottom')
+        bottom_axis.setStyle(tickFont=QFont("Arial", 10), tickTextOffset=4)
+        self.plot_widget.setLabel('bottom', 'Time', 's', font=QFont("Arial", 10))
 
-        legend = self.plot_widget.addLegend(offset=(10, 10), labelTextSize='10pt')
-        legend.setParentItem(self.plot_widget.graphicsItem())
-
-    def save_spike_click(self):
-        if self.process_step != 3:
-            QMessageBox.warning(self, "Save Conditions Not Met", "Please complete spike detection first!")
-            return
-
-        all_spike_times = [t for t, _ in self.high_prob_spikes] + [t for t, _ in self.low_prob_spikes]
-        save_success = save_spike_data(all_spike_times, self.current_data, self.fs)
-        if save_success:
-            self.status_label.setText(
-                f"Current Status: Spike results saved | {len(self.high_prob_spikes)} high-probability, {len(self.low_prob_spikes)} low-probability spikes"
-            )
-
-    def load_spike_click(self):
-        loaded_data = load_spike_data()
-        if loaded_data is None:
-            return
-
-        try:
-            self.current_data = loaded_data["eeg_data"]
-            self.fs = loaded_data["fs"]
-            self.total_samples = self.current_data.shape[1]
-            self.process_step = 3
-
-            self.high_prob_spikes = []
-            self.low_prob_spikes = []
-            spike_times = loaded_data["spike_times"]
-
-            total_duration = self.total_samples / self.fs
-            self.swi_value, self.spike_seconds, self.total_seconds = calculate_swi(spike_times, total_duration)
-
-            for t in spike_times:
-                self.high_prob_spikes.append((t, 1.0))
-
-            self.swi_label.setText(
-                f"【Spike Wave Index (SWI) Indicators】\n"
-                f"1. SWI value: {self.swi_value}%\n"
-                f"2. Total loaded spikes: {len(spike_times)}\n"
-                f"3. Seconds with spikes: {self.spike_seconds} seconds\n"
-                f"4. Total data seconds: {self.total_seconds} seconds\n"
-                f"5. Original data duration: {total_duration:.2f} seconds\n"
-                f"6. Data saved at: {loaded_data['save_time']}"
-            )
-
-            max_slider_value = max(0, self.total_samples - self.samples_per_window)
-            self.time_slider.setMaximum(max_slider_value)
-            self.time_slider.setEnabled(True)
-            self.update_plot_by_slider(0)
-
-            self.status_label.setText(
-                f"Current Status: Spike results loaded | {len(spike_times)} spikes loaded"
-            )
-            self.info_label.setText(
-                f"✅ Spike results loaded successfully!\n"
-                f"Loaded from file: {loaded_data.get('save_path', 'unknown')}\n"
-                f"Total spikes: {len(spike_times)}\n"
-                f"Sampling rate: {self.fs}Hz | Total duration: {total_duration:.2f} seconds\n"
-                f"Next step: Click 'Recalculate SWI' if adjustments are made"
-            )
-            self.recalc_swi_btn.setEnabled(True)
-            self.save_spike_btn.setEnabled(True)
-            self.plot_brain_btn.setEnabled(True)
-
-        except Exception as e:
-            QMessageBox.critical(self, "Load Failed", f"Error loading spike data:\n{str(e)}")
-            self.status_label.setText("Current Status: Spike results load failed | Model loaded successfully")
+    def closeEvent(self, event):
+        """Require explicit confirmation before closing the main window."""
+        reply = QMessageBox.question(
+            self,
+            "Confirm Exit",
+            "Are you sure you want to close the program?\n\n"
+            "Please make sure the current results and manual corrections have been saved.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            global _MATLAB_ENGINE, _MATLAB_ENGINE_PATHS_READY, _MATLAB_SHUTDOWN_REQUESTED
+            _MATLAB_SHUTDOWN_REQUESTED = True
+            if matlab_engine_is_ready():
+                with _MATLAB_ENGINE_LOCK:
+                    try:
+                        _MATLAB_ENGINE.quit()
+                    except Exception:
+                        pass
+                    _MATLAB_ENGINE = None
+                    _MATLAB_ENGINE_PATHS_READY = False
+            event.accept()
+        else:
+            event.ignore()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setFont(QFont("Arial", 16))
     window = EEGAutoSaveProcessor()
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec_())
+

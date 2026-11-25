@@ -8,6 +8,9 @@ Deep learning-based (ResNet+SPP+KAN) automatic detection system for Benign Epile
 3.Spatial Pyramid Pooling: Multi-scale feature aggregation
 4.Classifier: KAN (Kolmogorov-Arnold Network)
 
+## Final Data Augmentation (AUG06)
+Positive training segments are augmented with additive Gaussian noise and a 50% probability of true time-axis reversal. Frequency-domain perturbation is not part of the final protocol.
+
 ## Project Structure
 Train model/
 ├── README.md

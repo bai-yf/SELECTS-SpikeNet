@@ -9,12 +9,14 @@ CHANNEL_NAMES = ['FP1','FP2','F3','F4','C3','C4','P3','P4',
 SAMPLING_RATE = 500  # Hz
 
 # Model paths
-MODEL_WEIGHT_PATH = r"D:\bai\interface\code\fold_3_best_weights.pth"
-EFFICIENT_KAN_PATH = r"D:\bai\interface\code\efficient-kan\src"
+CODE_DIR = os.path.dirname(os.path.abspath(__file__))
+INTERFACE_DATA_DIR = os.path.abspath(os.path.join(CODE_DIR, "..", "data"))
+MODEL_WEIGHT_PATH = os.path.join(CODE_DIR, "fold_3_best_weights.pth")
+EFFICIENT_KAN_PATH = os.path.join(CODE_DIR, "efficient-kan", "src")
 
 # MATLAB paths
 EEGLAB_PATH = r"D:\MATLAB\R2024a\toolbox\eeglab"
-PROCESSED_DATA_DIR = r"D:\bai\interface\data\set"
+PROCESSED_DATA_DIR = os.path.join(INTERFACE_DATA_DIR, "set")
 
 # Detection parameters
 WINDOW_DURATION = 15  # seconds for display

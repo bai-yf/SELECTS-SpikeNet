@@ -1,11 +1,14 @@
 # core/models.py
 import torch
 import torch.nn as nn
+import os
 import sys
 import torch.nn.functional as F
 from torchvision.models.resnet import BasicBlock
 
-sys.path.append(r"D:\bai\interface\code\efficient-kan\src")
+EFFICIENT_KAN_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "efficient-kan", "src"))
+if EFFICIENT_KAN_PATH not in sys.path:
+    sys.path.append(EFFICIENT_KAN_PATH)
 from efficient_kan.kan import KAN
 
 class SpatialPyramidPooling(nn.Module):
