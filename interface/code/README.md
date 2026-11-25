@@ -8,4 +8,7 @@ The current interface supports TXT, EDF, and EEGLAB SET input; sleep-stage segme
 
 ## Weight provenance
 
-The checked-in weight must be the fold selected from the final AUG06 training run (Gaussian noise plus true time reversal). Before publishing a new weight, replace `fold_3_best_weights.pth` and record its source run and SHA-256 checksum in the release notes. The code does not silently download or substitute a weight.
+The project owner designates the checked-in `fold_3_best_weights.pth` as the final AUG06 inference weight (Gaussian noise plus true time reversal). The interface loads this file directly and does not download or substitute another weight.
+
+- Size: 39935594 bytes
+- SHA-256: `C097AD93595246434172342223AC2469496DDD2B18E3C5DB757305156AD04595`
