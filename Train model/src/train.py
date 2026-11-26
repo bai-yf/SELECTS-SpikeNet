@@ -13,7 +13,7 @@ from sklearn.model_selection import GroupKFold
 # Add src to path
 sys.path.append(str(Path(__file__).parent))
 
-from data_loader import load_patient_data, load_window_cache, EEGDataset
+from data_loader import load_window_cache, EEGDataset
 from models.fusion_model import FusionModel
 from utils.metrics import FocalLoss
 from utils.augmentation import augment
@@ -37,34 +37,17 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     
-    # 2. Load the same window cache used by the final AUG06 notebook. Raw SET
-    # loading remains available as a fallback for users rebuilding the cache.
+    # 2. Load the preprocessed window cache used by the AUG06 workflow.
     print("\n" + "="*50)
     print("1. Loading EEG windows")
     print("="*50)
 
-    if config['data'].get('use_window_cache', True):
-        X_all, y_all, metadata_df = load_window_cache(
-            config['data']['cache_npz_path'],
-            config['data']['cache_metadata_path'],
-        )
-        groups = metadata_df['patient_id'].astype(str).to_numpy()
-        print(f"Loaded {len(X_all)} cached windows from {len(np.unique(groups))} patients")
-    else:
-        meta_df = pd.read_excel(config['data']['metadata_path'], header=None)
-        all_patient_ids = list(dict.fromkeys(row[0].strip()[:11] for _, row in meta_df.iterrows()))
-        patient_data = load_patient_data(
-            meta_df=meta_df,
-            patient_ids=all_patient_ids,
-            data_dir=config['data']['raw_data_dir'],
-            config=config,
-        )
-        X_all = np.concatenate([item['X'] for item in patient_data])
-        y_all = np.concatenate([item['y'] for item in patient_data])
-        groups = np.concatenate([
-            np.repeat(item['pid'], len(item['y'])) for item in patient_data
-        ])
-        print(f"Built {len(X_all)} windows from {len(patient_data)} patients")
+    X_all, y_all, metadata_df = load_window_cache(
+        config['data']['cache_npz_path'],
+        config['data']['cache_metadata_path'],
+    )
+    groups = metadata_df['patient_id'].astype(str).to_numpy()
+    print(f"Loaded {len(X_all)} cached windows from {len(np.unique(groups))} patients")
     
     # 4. 5-fold cross-validation (grouped by patient)
     print("\n" + "="*50)
@@ -166,11 +149,10 @@ def main():
             'y_pred': val_preds,
             'prob_spike': val_probs,
         })
-        if config['data'].get('use_window_cache', True):
-            for column in ('window_index', 'start_time_sec', 'mid_time_sec',
-                           'end_time_sec', 'duration_sec'):
-                if column in metadata_df.columns:
-                    prediction_rows[column] = metadata_df.iloc[val_idx][column].to_numpy()
+        for column in ('window_index', 'start_time_sec', 'mid_time_sec',
+                       'end_time_sec', 'duration_sec'):
+            if column in metadata_df.columns:
+                prediction_rows[column] = metadata_df.iloc[val_idx][column].to_numpy()
         prediction_rows.to_csv(
             predictions_dir / f'fold_{fold + 1}_predictions.csv',
             index=False,

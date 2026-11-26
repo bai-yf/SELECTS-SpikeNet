@@ -18,11 +18,9 @@ Train model/
 ├── config/
 │   └── config.yaml
 ├── data/
-│   ├── raw/                    # Raw EEG data
-│   │   ├── subject1.set
-│   │   └── ... (another.set file)
-│   └── metadata/
-│       └── spick_time_label.xlsx  # The first column is the patient ID, followed by the time of spike wave onset
+│   └── cache/
+│       ├── dataset_windows_0p2s_500hz_44person.npz
+│       └── dataset_windows_0p2s_500hz_44person_metadata.csv
 ├── src/
 │   ├── __init__.py
 │   ├── data_loader.py
@@ -47,9 +45,9 @@ Train model/
 Modify the following paths in config/config.yaml:
 ```yaml
 data:
-  raw_data_dir: "data/raw"                     # Modify to your EEG data path
-  metadata_path: "data/metadata/spick_time_label.xlsx"  # Modify to your metadata path
-  results_dir: "results"                       # Results save path
+  cache_npz_path: "data/cache/dataset_windows_0p2s_500hz_44person.npz"
+  cache_metadata_path: "data/cache/dataset_windows_0p2s_500hz_44person_metadata.csv"
+  results_dir: "results"
 
 device: "cuda:0"  # Modify based on your GPU configuration
 
@@ -61,9 +59,7 @@ device: "cuda:0"  # Modify based on your GPU configuration
 mkdir -p BECT_EEG_Analysis/{config,data/{raw,metadata},src/{models,utils},results}
 ```
 2.Place the code files in corresponding directories
-3.Prepare data:
-    Place .set files in data/raw/
-    Place metadata Excel file in data/metadata/
+3.Prepare the preprocessed window cache and its patient/window metadata CSV in data/cache/
 4.Install dependencies:
 ```bash
 cd BECT_EEG_Analysis

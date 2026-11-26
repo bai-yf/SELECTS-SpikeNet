@@ -1,8 +1,4 @@
-"""
-EEG data loading and preprocessing module
-"""
-import os
-import mne
+"""Cached EEG-window loading and feature preparation."""
 import numpy as np
 import pandas as pd
 import torch
@@ -29,86 +25,6 @@ def load_window_cache(npz_path, metadata_path):
     if "patient_id" not in metadata.columns:
         raise ValueError("Window-cache metadata must contain a patient_id column")
     return X, y, metadata
-
-def load_patient_data(meta_df, patient_ids, data_dir, config):
-    """Load and preprocess each analyzed recording segment before windowing."""
-    patient_data = []
-    signal_config = config['signal']
-    
-    for i, row in meta_df.iterrows():
-        # Extract patient ID
-        pid = row[0].strip()[:11]
-        if pid not in patient_ids:
-            continue
-        
-        # Load EEG file
-        eeg_filename = row[0].strip() + ".set"
-        filepath = Path(data_dir) / eeg_filename
-        
-        if not filepath.exists():
-            print(f"Warning: {eeg_filename} does not exist, skipping")
-            continue
-        
-        # Read EEG data
-        raw = mne.io.read_raw_eeglab(filepath, preload=True, verbose=False)
-        channel_names = signal_config.get('channel_names')
-        if channel_names:
-            missing = [name for name in channel_names if name not in raw.ch_names]
-            if missing:
-                raise ValueError(f"{eeg_filename} is missing channels: {missing}")
-            raw.pick_channels(channel_names, ordered=True)
-        raw.set_eeg_reference(ref_channels='average', projection=False, verbose=False)
-        raw.notch_filter(freqs=[50], verbose=False)
-        raw.filter(l_freq=3, h_freq=70, verbose=False)
-        data = raw.get_data()
-
-        # Paper-consistent channel-wise Z-score over the complete analyzed
-        # recording segment. Windows are cut only after this operation.
-        channel_mean = np.mean(data, axis=1, keepdims=True)
-        channel_std = np.std(data, axis=1, keepdims=True)
-        data = (data - channel_mean) / (channel_std + 1e-6)
-        
-        # Segment data
-        X, y = segment_eeg_data(
-            data=data,
-            label_times=row[1:].dropna().astype(float).tolist(),
-            config=signal_config
-        )
-        
-        if len(X) > 0:
-            patient_data.append({
-                'pid': pid,
-                'X': np.array(X),
-                'y': np.array(y)
-            })
-    
-    return patient_data
-
-def segment_eeg_data(data, label_times, config):
-    """EEG window segmentation"""
-    sfreq = config['sampling_freq']
-    window_sec = config['window_sec']
-    half_window = int(window_sec * sfreq / 2)
-    pre_post_time = config['pre_post_time']
-    
-    X, y = [], []
-    max_start = data.shape[1] - 2 * half_window
-    
-    if max_start <= 0:
-        return X, y
-    
-    for s in range(0, max_start + 1, half_window):
-        end = s + 2 * half_window
-        seg = data[:, s:end]
-        
-        # Label determination
-        mid_time = (s + half_window) / sfreq
-        label = 1 if any(abs(mid_time - t) <= pre_post_time for t in label_times) else 0
-        
-        X.append(seg)
-        y.append(label)
-    
-    return X, y
 
 class EEGDataset(Dataset):
     def __init__(self, X, y, config):

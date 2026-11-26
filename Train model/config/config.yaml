@@ -1,9 +1,6 @@
 # Data path configuration
 data:
-  raw_data_dir: "data/raw"                     # Raw EEG data path
-  metadata_path: "data/metadata/spick_time_label.xlsx"  # Metadata file path
   results_dir: "results"                       # Results save path
-  use_window_cache: true                        # Match the final AUG06 notebook
   cache_npz_path: "data/cache/dataset_windows_0p2s_500hz_44person.npz"
   cache_metadata_path: "data/cache/dataset_windows_0p2s_500hz_44person_metadata.csv"
 

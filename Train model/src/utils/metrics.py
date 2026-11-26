@@ -24,33 +24,6 @@ class FocalLoss(nn.Module):
         )
         return (alpha_t * (1 - pt) ** self.gamma * ce_loss).mean()
 
-def calculate_swi_from_times(annotation_times, predicted_positive_times,
-                             total_duration_sec):
-    """Calculate patient-level SWI from unique one-second epochs.
-
-    Annotation timestamps and positive-window midpoint timestamps must use the
-    same patient-relative time coordinate. Multiple events or windows within
-    one integer second contribute only once.
-    """
-    total_seconds = int(np.ceil(float(total_duration_sec)))
-    if total_seconds <= 0:
-        return 0.0, 0.0, 0.0
-
-    def occupied_seconds(times):
-        values = np.asarray(times, dtype=float)
-        values = values[np.isfinite(values)]
-        return {
-            int(np.floor(value))
-            for value in values
-            if 0 <= value < total_duration_sec
-        }
-
-    true_seconds = occupied_seconds(annotation_times)
-    predicted_seconds = occupied_seconds(predicted_positive_times)
-    swi_true = 100.0 * len(true_seconds) / total_seconds
-    swi_pred = 100.0 * len(predicted_seconds) / total_seconds
-    return swi_true, swi_pred, abs(swi_true - swi_pred)
-
 def compute_metrics(y_true, y_pred):
     """Calculate comprehensive evaluation metrics"""
     report = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
