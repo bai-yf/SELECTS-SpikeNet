@@ -79,3 +79,17 @@ python src/train.py
 After training, the following files are generated in results/:
     Best weights for each fold (fold_X_best_weights.pth)
     Cross-validation summary results (cross_validation_summary.csv)
+    Held-out window predictions (predictions/fold_X_predictions.csv)
+
+## Patient-level SWI
+
+Recompute SWI from original annotation timestamps and held-out window midpoint predictions:
+
+```bash
+python src/recompute_patient_swi_tables.py \
+  --predictions-dir results/predictions \
+  --annotations-csv data/annotation_times.csv \
+  --output-dir results
+```
+
+The annotation CSV uses long format with columns `patient_id` and `spike_time_sec`. For each patient, original annotation timestamps define true spike-containing one-second epochs; predicted-positive windows are assigned by `mid_time_sec` and combined by logical OR. SWIAE is the macro-average of patient-level absolute errors.
