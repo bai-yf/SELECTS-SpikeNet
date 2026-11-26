@@ -7,6 +7,14 @@
 
 An integrated clinical software system for end-to-end automatic spike detection in Self-Limited Epilepsy with Centrotemporal Spikes (SeLECTS) from long-term EEG recordings. The system combines signal processing, machine learning, and interactive visualization for comprehensive EEG analysis.
 
+## Baseline implementations
+
+The five baseline implementations used for the final manuscript comparison are
+provided in [`final_baselines`](final_baselines): EEGPT, EEGNeX, EEGNet,
+EEGFormer, and LaBraM. Earlier exploratory reproductions are preserved in
+[`legacy_baseline_reproductions`](legacy_baseline_reproductions) and are not
+the source of the final manuscript baseline results.
+
 [https://github.com/bai-yf/SELECTS-SpikeNet/blob/master/interface/interface.png]
 
 🚀 Quick Start
@@ -77,6 +85,8 @@ python main.py
 📁 File Directory Structure
 ```text
 SELECTS-SpikeNet/
+├── final_baselines/                    # Final EEGPT/EEGNeX/EEGNet/EEGFormer/LaBraM baselines
+├── legacy_baseline_reproductions/      # Archived exploratory comparison code
 ├── interface/                          # GUI application (for users)
 │   └── code/
 │       ├── main.py                     # Main GUI application entry

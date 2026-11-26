@@ -10,3 +10,15 @@ env/
 # IDE 配置文件
 .vscode/
 .idea/
+
+# Local baseline artifacts and private data
+final_baselines/**/fold_*_best_weights.pth
+final_baselines/**/results/
+final_baselines/**/manual_correction_results/
+final_baselines/**/manual_seizure_time_csv/
+final_baselines/**/manual_sleep_stage_labels/
+final_baselines/**/tfr_cache/
+final_baselines/**/build/
+final_baselines/**/dist/
+final_baselines/**/AppData/
+final_baselines/**/upstream/
