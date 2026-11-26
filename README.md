@@ -95,22 +95,87 @@ Only the proposed LR34-SK interface and inference checkpoint are distributed. Ba
 
 ### Installation
 
-Python 3.9 or later is recommended. On Windows:
+The interface was developed on Windows with Python 3.9, PyTorch 2.5.1, MATLAB R2024a, and EEGLAB. Python 3.9 or later is recommended. The commands below use PowerShell.
 
-```bash
+#### 1. Clone the repository and install the Python dependencies
+
+```powershell
 git clone https://github.com/bai-yf/SELECTS-SpikeNet.git
 cd SELECTS-SpikeNet/interface/code
 python -m venv .venv
 .venv\Scripts\activate
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-The interface uses MATLAB Engine and EEGLAB for the MATLAB preprocessing path. Install MATLAB Engine for Python and configure the local EEGLAB path before using that path. EDF and preprocessed EEGLAB SET input are also supported by the interface.
+The dependency file for the interface is `interface/code/requirements.txt`, not the requirements file under `Train model`. It includes the tested versions of PyTorch, MNE-Python, NumPy, pandas, SciPy, PyQt5, pyqtgraph, Matplotlib, and MATLAB Engine for Python.
+
+The proposed classifier also uses [`efficient-kan`](https://github.com/Blealtan/efficient-kan). If `interface/code/efficient-kan/src/efficient_kan` is not present after cloning this repository, clone the upstream implementation into that exact location:
+
+```powershell
+cd SELECTS-SpikeNet/interface/code
+git clone https://github.com/Blealtan/efficient-kan.git efficient-kan
+```
+
+#### 2. Install MATLAB and MATLAB Engine for Python
+
+MATLAB is required when the interface preprocesses raw TXT data or an unprocessed EEGLAB SET file. MATLAB R2024a is the tested version. Install MATLAB first, then install the Python engine into the same virtual environment used by the interface.
+
+`matlabengine==24.1` is included in `interface/code/requirements.txt`. If it was installed successfully by the command above, no additional Engine command is needed. Otherwise, with the virtual environment activated, install it from the local MATLAB installation:
+
+```powershell
+cd "<MATLAB_ROOT>\extern\engines\python"
+python -m pip install .
+```
+
+Replace `<MATLAB_ROOT>` with the folder returned by running `matlabroot` inside MATLAB, for example `C:\Program Files\MATLAB\R2024a`. The MATLAB release and MATLAB Engine package must be mutually compatible.
+
+You can verify the Python-side installation with:
+
+```powershell
+python -c "import matlab.engine; print('MATLAB Engine is available')"
+```
+
+#### 3. Install and configure EEGLAB
+
+Download EEGLAB from the [official EEGLAB website](https://sccn.ucsd.edu/eeglab/download.php) or its [official GitHub repository](https://github.com/sccn/eeglab), and extract it to a local folder. The preprocessing code calls EEGLAB functions including `pop_loadset`, `pop_eegfiltnew`, and `pop_saveset`, so make sure the EEGLAB installation provides these functions.
+
+Open `interface/code/config.py` and set `EEGLAB_PATH` to the root of your own EEGLAB installation. Do not copy the example path literally:
+
+```python
+EEGLAB_PATH = r"<path-to-your-eeglab-folder>"
+```
+
+For example, if `eeglab.m` is located at `C:\Tools\eeglab\eeglab.m`, use:
+
+```python
+EEGLAB_PATH = r"C:\Tools\eeglab"
+```
+
+The application adds the required EEGLAB folders to the MATLAB path when preprocessing starts. To check the installation manually, start MATLAB and run:
+
+```matlab
+addpath(genpath('<path-to-your-eeglab-folder>'));
+which pop_loadset
+which pop_eegfiltnew
+which pop_saveset
+```
+
+Each `which` command should resolve to a file in the EEGLAB installation. If `pop_eegfiltnew` is missing, install or enable EEGLAB's FIR filtering support before running the interface.
+
+#### 4. Choose the appropriate input path
+
+- **Raw TXT or unprocessed SET:** MATLAB, MATLAB Engine for Python, and EEGLAB are required. Import the file and run the preprocessing step before spike detection.
+- **Already preprocessed EEGLAB SET:** use the preprocessed-data import function; the MATLAB preprocessing step is skipped.
+- **EDF or SET associated with sleep-stage labels:** these formats are supported by the sleep-stage import workflow and are read with MNE-Python. Use data that have already undergone the preprocessing expected by the model if the MATLAB preprocessing step is skipped.
+
+The model expects 16 EEG channels in the order documented in `interface/code/config.py`, sampled at 500 Hz. Files with different channel names, channel order, sampling rate, or preprocessing may require conversion before inference.
 
 ### Run
 
-```bash
+```powershell
 cd SELECTS-SpikeNet/interface/code
+.venv\Scripts\activate
 python main.py
 ```
 
