@@ -19,9 +19,6 @@ This repository provides the proposed LR34-SK detector, its clinical review inte
 The framework detects epileptiform spikes in long-term non-rapid eye movement (NREM) EEG from patients diagnosed with self-limited epilepsy with centrotemporal spikes (SeLECTS). It integrates:
 
 - 16-channel EEG preprocessing and 0.2-second sliding-window analysis;
-- raw EEG, first- and second-order differential features, and smoothed nonlinear energy (SNE);
-- a Lightweight ResNet-34 backbone with spatial pyramid pooling (SPP);
-- a Kolmogorov–Arnold Network (KAN) classifier;
 - automatic candidate detection and confidence visualization;
 - sleep-stage import, expert confirmation/correction, autosave, and result management; and
 - patient-level SWI estimation using original annotation timestamps and one-second epochs.
