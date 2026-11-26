@@ -9,6 +9,27 @@ import torch
 from torch.utils.data import Dataset
 from pathlib import Path
 
+
+def load_window_cache(npz_path, metadata_path):
+    """Load the window cache used by the final AUG06 notebook."""
+    npz_path = Path(npz_path)
+    metadata_path = Path(metadata_path)
+    if not npz_path.exists() or not metadata_path.exists():
+        raise FileNotFoundError(
+            "Window cache is incomplete: "
+            f"{npz_path} and {metadata_path} are both required"
+        )
+
+    cache = np.load(npz_path, allow_pickle=True)
+    X = cache["X"]
+    y = cache["y"]
+    metadata = pd.read_csv(metadata_path)
+    if len(X) != len(y) or len(X) != len(metadata):
+        raise ValueError("Window cache arrays and metadata have different lengths")
+    if "patient_id" not in metadata.columns:
+        raise ValueError("Window-cache metadata must contain a patient_id column")
+    return X, y, metadata
+
 def load_patient_data(meta_df, patient_ids, data_dir, config):
     """Load patient data"""
     patient_data = []
@@ -86,11 +107,9 @@ class EEGDataset(Dataset):
     def preprocess_features(self, X):
         """Feature preprocessing"""
         from utils.preprocessing import extract_multi_channel_features
-        
-        X_normalized = (X - np.mean(X, axis=2, keepdims=True)) / (np.std(X, axis=2, keepdims=True) + 1e-6)
-        
+
         features = []
-        for seg in X_normalized:
+        for seg in X:
             feat = extract_multi_channel_features(seg)
             features.append(feat)
         

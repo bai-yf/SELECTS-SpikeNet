@@ -3,6 +3,9 @@ data:
   raw_data_dir: "data/raw"                     # Raw EEG data path
   metadata_path: "data/metadata/spick_time_label.xlsx"  # Metadata file path
   results_dir: "results"                       # Results save path
+  use_window_cache: true                        # Match the final AUG06 notebook
+  cache_npz_path: "data/cache/dataset_windows_0p2s_500hz_44person.npz"
+  cache_metadata_path: "data/cache/dataset_windows_0p2s_500hz_44person_metadata.csv"
 
 # Signal processing parameters
 signal:
@@ -14,16 +17,35 @@ signal:
 # Training parameters
 training:
   batch_size: 64
-  epochs: 30
+  epochs: 50
   learning_rate: 1e-4
+  weight_decay: 1e-4
   patience: 5                                  # Early stopping patience
+  early_stop_min_delta: 0.003
   seed: 42                                     # Random seed
+  n_splits: 5
+
+# Final AUG06: one augmented copy per positive window. Each copy receives
+# 3% Gaussian noise and is then reversed along the true time axis.
+augmentation:
+  enabled: true
+  strategy: "noise_time_reverse"
+  repeats: 1
+  noise_std_ratio: 0.03
 
 # Model parameters
 model:
   resnet_dropout: 0.3
+  in_channels: 4
+  block_plan: [3, 4, 6, 3]
+  channel_plan: [32, 64, 128, 128]
+  pooling: "spp"
   spp_output_sizes: [1, 2, 4]                  # SPP output sizes
   kan_layers: [128, 64]                        # KAN hidden layers
+
+loss:
+  focal_alpha: 0.65
+  focal_gamma: 2.0
 
 # Device configuration
 device: "cuda:0"                               # Options: "cpu" or "cuda:0", "cuda:1"

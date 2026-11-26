@@ -14,7 +14,7 @@ class KANClassifier(nn.Module):
     def __init__(self, feature_dim, num_classes, hidden_layers=[128, 64]):
         super().__init__()
         # Build KAN layer structure
-        kan_layers = [feature_dim] + hidden_layers + [num_classes]
+        kan_layers = [feature_dim] + list(hidden_layers) + [num_classes]
         self.kan = KAN(kan_layers)
     
     def forward(self, x):

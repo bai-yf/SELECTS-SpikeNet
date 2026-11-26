@@ -1,27 +1,11 @@
-"""
-Training utility functions
-"""
+"""Training utility functions."""
+import copy
+
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
 from sklearn.metrics import classification_report
 
-class FocalLoss(nn.Module):
-    """Focal Loss function"""
-    def __init__(self, alpha=0.25, gamma=2.0):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-    
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
-        pt = torch.exp(-ce_loss)
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
-        return focal_loss.mean()
-
 def train_model(model, train_loader, val_loader, criterion, optimizer, 
-                epochs, patience, fold, device, save_path):
+                epochs, patience, min_delta, fold, device, save_path):
     """Training function"""
     best_model_state = None
     best_f1 = -1.0
@@ -72,10 +56,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer,
         current_acc = report['accuracy']
         
         # Update best model
-        if current_f1 > best_f1:
+        if current_f1 > best_f1 + min_delta:
             best_f1 = current_f1
             best_acc = current_acc
-            best_model_state = model.state_dict().copy()
+            best_model_state = copy.deepcopy(model.state_dict())
             best_val_preds = val_preds
             best_val_labels = val_labels
             torch.save(best_model_state, save_path)

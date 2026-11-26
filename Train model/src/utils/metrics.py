@@ -2,22 +2,27 @@
 Evaluation metrics calculation functions
 """
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.metrics import classification_report, confusion_matrix
 
-class FocalLoss:
-    """Focal Loss function"""
-    def __init__(self, alpha=0.25, gamma=2.0):
+class FocalLoss(nn.Module):
+    """Binary focal loss used by the final AUG06 notebook."""
+    def __init__(self, alpha=0.65, gamma=2.0):
+        super().__init__()
         self.alpha = alpha
         self.gamma = gamma
-    
-    def __call__(self, inputs, targets):
-        import torch
-        import torch.nn.functional as F
-        
+
+    def forward(self, inputs, targets):
         ce_loss = F.cross_entropy(inputs, targets, reduction='none')
         pt = torch.exp(-ce_loss)
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
-        return focal_loss.mean()
+        alpha_t = torch.where(
+            targets == 1,
+            torch.full_like(ce_loss, self.alpha),
+            torch.full_like(ce_loss, 1.0 - self.alpha),
+        )
+        return (alpha_t * (1 - pt) ** self.gamma * ce_loss).mean()
 
 def compute_swi(y_true, y_pred, window_sec):
     """Calculate SWI metric"""

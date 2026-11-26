@@ -13,7 +13,7 @@ from sklearn.model_selection import GroupKFold
 # Add src to path
 sys.path.append(str(Path(__file__).parent))
 
-from data_loader import load_patient_data, EEGDataset
+from data_loader import load_patient_data, load_window_cache, EEGDataset
 from models.fusion_model import FusionModel
 from utils.metrics import FocalLoss, compute_swi
 from utils.augmentation import augment
@@ -37,58 +37,71 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     
-    # 2. Load data
+    # 2. Load the same window cache used by the final AUG06 notebook. Raw SET
+    # loading remains available as a fallback for users rebuilding the cache.
     print("\n" + "="*50)
-    print("1. Loading metadata and patient data")
+    print("1. Loading EEG windows")
     print("="*50)
-    
-    meta_df = pd.read_excel(config['data']['metadata_path'], header=None)
-    all_patient_ids = list(set([row[0].strip()[:11] for _, row in meta_df.iterrows()]))
-    print(f"Total patients: {len(all_patient_ids)}")
-    
-    # 3. Load EEG data
-    train_val_data = load_patient_data(
-        meta_df=meta_df,
-        patient_ids=all_patient_ids,
-        data_dir=config['data']['raw_data_dir'],
-        config=config
-    )
-    print(f"Successfully loaded data from {len(train_val_data)} patients")
+
+    if config['data'].get('use_window_cache', True):
+        X_all, y_all, metadata_df = load_window_cache(
+            config['data']['cache_npz_path'],
+            config['data']['cache_metadata_path'],
+        )
+        groups = metadata_df['patient_id'].astype(str).to_numpy()
+        print(f"Loaded {len(X_all)} cached windows from {len(np.unique(groups))} patients")
+    else:
+        meta_df = pd.read_excel(config['data']['metadata_path'], header=None)
+        all_patient_ids = list(dict.fromkeys(row[0].strip()[:11] for _, row in meta_df.iterrows()))
+        patient_data = load_patient_data(
+            meta_df=meta_df,
+            patient_ids=all_patient_ids,
+            data_dir=config['data']['raw_data_dir'],
+            config=config,
+        )
+        X_all = np.concatenate([item['X'] for item in patient_data])
+        y_all = np.concatenate([item['y'] for item in patient_data])
+        groups = np.concatenate([
+            np.repeat(item['pid'], len(item['y'])) for item in patient_data
+        ])
+        print(f"Built {len(X_all)} windows from {len(patient_data)} patients")
     
     # 4. 5-fold cross-validation (grouped by patient)
     print("\n" + "="*50)
     print("2. Starting 5-fold cross-validation")
     print("="*50)
     
-    gkf = GroupKFold(n_splits=5)
-    patient_ids_for_split = [d["pid"] for d in train_val_data]
-    X_split = np.arange(len(train_val_data))
-    y_split = np.zeros(len(train_val_data))
+    gkf = GroupKFold(n_splits=config['training']['n_splits'])
     
     fold_results = []
     
-    for fold, (train_idx, val_idx) in enumerate(gkf.split(X_split, y_split, groups=patient_ids_for_split)):
-        print(f"\n[Fold {fold+1}/5] Starting training")
-        
-        # Data preparation
-        train_patient_data = [train_val_data[i] for i in train_idx]
-        val_patient_data = [train_val_data[i] for i in val_idx]
-        
-        # Concatenate training set
-        train_X = np.concatenate([d["X"] for d in train_patient_data])
-        train_y = np.concatenate([d["y"] for d in train_patient_data])
-        
-        # Concatenate validation set
-        val_X = np.concatenate([d["X"] for d in val_patient_data])
-        val_y = np.concatenate([d["y"] for d in val_patient_data])
+    splits = gkf.split(X_all, y_all, groups=groups)
+    for fold, (train_idx, val_idx) in enumerate(splits):
+        print(f"\n[Fold {fold+1}/{config['training']['n_splits']}] Starting training")
+
+        train_X = X_all[train_idx]
+        train_y = y_all[train_idx]
+        val_X = X_all[val_idx]
+        val_y = y_all[val_idx]
         
         # Positive sample augmentation for training set
+        augmentation_config = config['augmentation']
         pos_idx = np.where(train_y == 1)[0]
-        if len(pos_idx) > 0:
-            augmented_X = [augment(train_X[i].T).T for i in pos_idx]
-            augmented_X = np.array(augmented_X)
+        if augmentation_config['enabled'] and len(pos_idx) > 0:
+            augmented_X = np.array([
+                augment(
+                    train_X[i],
+                    strategy=augmentation_config['strategy'],
+                    noise_std_ratio=augmentation_config['noise_std_ratio'],
+                )
+                for i in pos_idx
+                for _ in range(augmentation_config['repeats'])
+            ])
             train_X = np.concatenate([train_X, augmented_X], axis=0)
-            train_y = np.concatenate([train_y, np.ones(len(pos_idx), dtype=train_y.dtype)], axis=0)
+            train_y = np.concatenate([
+                train_y,
+                np.ones(len(augmented_X), dtype=train_y.dtype),
+            ])
         
         print(f"[Fold {fold+1}] Dataset size:")
         print(f"  Training set: {train_X.shape[0]} samples (positive: {np.sum(train_y==1)}, negative: {np.sum(train_y==0)})")
@@ -106,13 +119,25 @@ def main():
             num_channels=signal_config['n_channels'],
             time_steps=int(signal_config['sampling_freq'] * signal_config['window_sec']),
             num_classes=2,
+            in_channels=config['model']['in_channels'],
+            channel_plan=tuple(config['model']['channel_plan']),
+            block_plan=tuple(config['model']['block_plan']),
+            pooling=config['model']['pooling'],
+            dropout_rate=config['model']['resnet_dropout'],
             spp_output_sizes=config['model']['spp_output_sizes'],
             kan_layers=config['model']['kan_layers']
         ).to(device)
         
         # Loss function and optimizer
-        criterion = FocalLoss(alpha=0.65, gamma=2.0)
-        optimizer = torch.optim.Adam(model.parameters(), lr=config['training']['learning_rate'])
+        criterion = FocalLoss(
+            alpha=config['loss']['focal_alpha'],
+            gamma=config['loss']['focal_gamma'],
+        )
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=config['training']['learning_rate'],
+            weight_decay=config['training']['weight_decay'],
+        )
         
         # Save path
         save_path = Path(config['data']['results_dir']) / f"fold_{fold+1}_best_weights.pth"
@@ -126,6 +151,7 @@ def main():
             optimizer=optimizer,
             epochs=config['training']['epochs'],
             patience=config['training']['patience'],
+            min_delta=config['training']['early_stop_min_delta'],
             fold=fold,
             device=device,
             save_path=save_path
