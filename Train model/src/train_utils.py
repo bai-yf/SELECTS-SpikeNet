@@ -13,6 +13,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer,
     early_stop_counter = 0
     best_val_preds = []
     best_val_labels = []
+    best_val_probs = []
     
     for epoch in range(epochs):
         # Training phase
@@ -36,6 +37,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer,
         val_loss = 0.0
         val_preds = []
         val_labels = []
+        val_probs = []
         
         with torch.no_grad():
             for X, y in val_loader:
@@ -46,6 +48,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer,
                 val_loss += loss.item() * X.size(0)
                 val_preds.extend(outputs.argmax(1).cpu().numpy())
                 val_labels.extend(y.cpu().numpy())
+                val_probs.extend(torch.softmax(outputs, dim=1)[:, 1].cpu().numpy())
         
         avg_val_loss = val_loss / len(val_loader.dataset)
         
@@ -62,6 +65,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer,
             best_model_state = copy.deepcopy(model.state_dict())
             best_val_preds = val_preds
             best_val_labels = val_labels
+            best_val_probs = val_probs
             torch.save(best_model_state, save_path)
             early_stop_counter = 0
         else:
@@ -75,4 +79,5 @@ def train_model(model, train_loader, val_loader, criterion, optimizer,
               f"Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
               f"Val F1: {current_f1:.4f} | Val Acc: {current_acc:.4f}")
     
-    return best_model_state, best_f1, best_acc, best_val_preds, best_val_labels
+    return (best_model_state, best_f1, best_acc, best_val_preds,
+            best_val_labels, best_val_probs)

@@ -31,7 +31,7 @@ def load_window_cache(npz_path, metadata_path):
     return X, y, metadata
 
 def load_patient_data(meta_df, patient_ids, data_dir, config):
-    """Load patient data"""
+    """Load and preprocess each analyzed recording segment before windowing."""
     patient_data = []
     signal_config = config['signal']
     
@@ -50,8 +50,23 @@ def load_patient_data(meta_df, patient_ids, data_dir, config):
             continue
         
         # Read EEG data
-        raw = mne.io.read_raw_eeglab(filepath, preload=True)
+        raw = mne.io.read_raw_eeglab(filepath, preload=True, verbose=False)
+        channel_names = signal_config.get('channel_names')
+        if channel_names:
+            missing = [name for name in channel_names if name not in raw.ch_names]
+            if missing:
+                raise ValueError(f"{eeg_filename} is missing channels: {missing}")
+            raw.pick_channels(channel_names, ordered=True)
+        raw.set_eeg_reference(ref_channels='average', projection=False, verbose=False)
+        raw.notch_filter(freqs=[50], verbose=False)
+        raw.filter(l_freq=3, h_freq=70, verbose=False)
         data = raw.get_data()
+
+        # Paper-consistent channel-wise Z-score over the complete analyzed
+        # recording segment. Windows are cut only after this operation.
+        channel_mean = np.mean(data, axis=1, keepdims=True)
+        channel_std = np.std(data, axis=1, keepdims=True)
+        data = (data - channel_mean) / (channel_std + 1e-6)
         
         # Segment data
         X, y = segment_eeg_data(
@@ -85,9 +100,6 @@ def segment_eeg_data(data, label_times, config):
     for s in range(0, max_start + 1, half_window):
         end = s + 2 * half_window
         seg = data[:, s:end]
-        
-        # Normalization
-        seg = (seg - np.mean(seg, axis=1, keepdims=True)) / (np.std(seg, axis=1, keepdims=True) + 1e-6)
         
         # Label determination
         mid_time = (s + half_window) / sfreq

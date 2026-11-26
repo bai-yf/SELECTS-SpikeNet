@@ -11,8 +11,6 @@ Deep learning-based (ResNet+SPP+KAN) automatic detection system for Benign Epile
 ## Final Data Augmentation (AUG06)
 Each positive training segment receives one augmented copy. The copy first receives Gaussian noise with a standard deviation equal to 3% of the segment standard deviation, then is always reversed along the true time axis. Frequency-domain perturbation is not part of the final protocol.
 
-The modular training code is synchronized to the project owner's reference notebook `aug06_noise_time_reverse.ipynb` (SHA-256: `3C6006B63CA2336A808F002A85D6E8D7EC21DA556356ADFA61712588B298997A`).
-
 ## Project Structure
 Train model/
 ├── README.md

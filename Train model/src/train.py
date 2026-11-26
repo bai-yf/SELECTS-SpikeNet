@@ -15,7 +15,7 @@ sys.path.append(str(Path(__file__).parent))
 
 from data_loader import load_patient_data, load_window_cache, EEGDataset
 from models.fusion_model import FusionModel
-from utils.metrics import FocalLoss, compute_swi
+from utils.metrics import FocalLoss
 from utils.augmentation import augment
 from train_utils import train_model
 
@@ -143,7 +143,7 @@ def main():
         save_path = Path(config['data']['results_dir']) / f"fold_{fold+1}_best_weights.pth"
         
         # Train model
-        best_model_state, best_f1, best_acc, val_preds, val_labels = train_model(
+        best_model_state, best_f1, best_acc, val_preds, val_labels, val_probs = train_model(
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,
@@ -157,16 +157,31 @@ def main():
             save_path=save_path
         )
         
-        # Calculate SWI metrics
-        swi_true, swi_pred = compute_swi(val_labels, val_preds, window_sec=signal_config['window_sec'])
+        predictions_dir = Path(config['data']['results_dir']) / 'predictions'
+        predictions_dir.mkdir(parents=True, exist_ok=True)
+        prediction_rows = pd.DataFrame({
+            'fold': fold + 1,
+            'patient_id': groups[val_idx],
+            'y_true': val_labels,
+            'y_pred': val_preds,
+            'prob_spike': val_probs,
+        })
+        if config['data'].get('use_window_cache', True):
+            for column in ('window_index', 'start_time_sec', 'mid_time_sec',
+                           'end_time_sec', 'duration_sec'):
+                if column in metadata_df.columns:
+                    prediction_rows[column] = metadata_df.iloc[val_idx][column].to_numpy()
+        prediction_rows.to_csv(
+            predictions_dir / f'fold_{fold + 1}_predictions.csv',
+            index=False,
+            encoding='utf-8-sig',
+        )
         
         # Record results
         fold_results.append({
             'fold': fold + 1,
             'best_f1': best_f1,
             'best_acc': best_acc,
-            'swi_true': swi_true,
-            'swi_pred': swi_pred,
             'weight_path': str(save_path)
         })
         
@@ -174,9 +189,6 @@ def main():
         print(f"\nFold {fold+1} Results:")
         print(f"  F1 Score: {best_f1:.4f}")
         print(f"  Accuracy: {best_acc:.4f}")
-        print(f"  True SWI: {swi_true:.2f}%")
-        print(f"  Predicted SWI: {swi_pred:.2f}%")
-        print(f"  SWI Error: {abs(swi_true - swi_pred):.2f}%")
     
     # 5. Summarize results
     print("\n" + "="*50)
@@ -185,16 +197,12 @@ def main():
     
     avg_f1 = np.mean([res['best_f1'] for res in fold_results])
     avg_acc = np.mean([res['best_acc'] for res in fold_results])
-    avg_swi_error = np.mean([abs(res['swi_true'] - res['swi_pred']) for res in fold_results])
-    
     std_f1 = np.std([res['best_f1'] for res in fold_results])
     std_acc = np.std([res['best_acc'] for res in fold_results])
-    std_swi_error = np.std([abs(res['swi_true'] - res['swi_pred']) for res in fold_results])
     
     print(f"\nSummary Results:")
     print(f"  Average F1 Score: {avg_f1:.4f} ± {std_f1:.4f}")
     print(f"  Average Accuracy: {avg_acc:.4f} ± {std_acc:.4f}")
-    print(f"  Average SWI Error: {avg_swi_error:.2f}% ± {std_swi_error:.2f}%")
     
     # Save summary results to CSV
     results_df = pd.DataFrame(fold_results)

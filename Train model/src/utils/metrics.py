@@ -24,24 +24,32 @@ class FocalLoss(nn.Module):
         )
         return (alpha_t * (1 - pt) ** self.gamma * ce_loss).mean()
 
-def compute_swi(y_true, y_pred, window_sec):
-    """Calculate SWI metric"""
-    samples_per_sec = int(1 / window_sec)
-    
-    # Aggregate by second
-    sec_true = []
-    sec_pred = []
-    
-    for i in range(0, len(y_true), samples_per_sec):
-        end_idx = min(i + samples_per_sec, len(y_true))
-        sec_true.append(int(any(y_true[i:end_idx])))
-        sec_pred.append(int(any(y_pred[i:end_idx])))
-    
-    # Calculate percentage
-    swi_true = np.mean(sec_true) * 100
-    swi_pred = np.mean(sec_pred) * 100
-    
-    return swi_true, swi_pred
+def calculate_swi_from_times(annotation_times, predicted_positive_times,
+                             total_duration_sec):
+    """Calculate patient-level SWI from unique one-second epochs.
+
+    Annotation timestamps and positive-window midpoint timestamps must use the
+    same patient-relative time coordinate. Multiple events or windows within
+    one integer second contribute only once.
+    """
+    total_seconds = int(np.ceil(float(total_duration_sec)))
+    if total_seconds <= 0:
+        return 0.0, 0.0, 0.0
+
+    def occupied_seconds(times):
+        values = np.asarray(times, dtype=float)
+        values = values[np.isfinite(values)]
+        return {
+            int(np.floor(value))
+            for value in values
+            if 0 <= value < total_duration_sec
+        }
+
+    true_seconds = occupied_seconds(annotation_times)
+    predicted_seconds = occupied_seconds(predicted_positive_times)
+    swi_true = 100.0 * len(true_seconds) / total_seconds
+    swi_pred = 100.0 * len(predicted_seconds) / total_seconds
+    return swi_true, swi_pred, abs(swi_true - swi_pred)
 
 def compute_metrics(y_true, y_pred):
     """Calculate comprehensive evaluation metrics"""
