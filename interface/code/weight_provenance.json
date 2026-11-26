@@ -1,13 +1,6 @@
 {
   "file": "fold_3_best_weights.pth",
-  "designated_protocol": "AUG06",
-  "augmentation": [
-    "Gaussian noise at 3% of segment standard deviation",
-    "true time-axis reversal for every generated positive augmentation"
-  ],
   "model_architecture": "LightResNet34 + SPP + KAN",
   "size_bytes": 39935594,
-  "sha256": "C097AD93595246434172342223AC2469496DDD2B18E3C5DB757305156AD04595",
-  "designation_source": "Project owner confirmation",
-  "designation_date": "2026-11-25"
+  "sha256": "C097AD93595246434172342223AC2469496DDD2B18E3C5DB757305156AD04595"
 }

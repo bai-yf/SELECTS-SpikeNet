@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 def load_window_cache(npz_path, metadata_path):
-    """Load the window cache used by the final AUG06 notebook."""
+    """Load the preprocessed window cache and its metadata."""
     npz_path = Path(npz_path)
     metadata_path = Path(metadata_path)
     if not npz_path.exists() or not metadata_path.exists():

@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from sklearn.metrics import classification_report, confusion_matrix
 
 class FocalLoss(nn.Module):
-    """Binary focal loss used by the final AUG06 notebook."""
+    """Binary focal loss used by the final training protocol."""
     def __init__(self, alpha=0.65, gamma=2.0):
         super().__init__()
         self.alpha = alpha

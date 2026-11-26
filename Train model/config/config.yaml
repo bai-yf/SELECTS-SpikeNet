@@ -23,7 +23,7 @@ training:
   seed: 42                                     # Random seed
   n_splits: 5
 
-# Final AUG06: one augmented copy per positive window. Each copy receives
+# One augmented copy per positive window. Each copy receives
 # 3% Gaussian noise and is then reversed along the true time axis.
 augmentation:
   enabled: true

@@ -10,7 +10,7 @@ Official code for the paper **“An End-to-End Framework for Long-Term Epileptic
 
 **Affiliations:** ShanghaiTech University, Shanghai, China
 
-This repository provides the proposed LR34-SK detector, its clinical review interface, the final AUG06 training configuration, patient-level spike-wave index (SWI) evaluation code, and training implementations of five representative EEG baselines.
+This repository provides the proposed LR34-SK detector, its clinical review interface, training code, patient-level spike-wave index (SWI) evaluation code, and training implementations of five representative EEG baselines.
 
 > This software is intended for research and assistive EEG review. It is not a standalone diagnostic system.
 
@@ -39,20 +39,6 @@ Patient-grouped five-fold cross-validation was performed on 44 pediatric patient
 
 The long-term workflow was additionally evaluated on three recordings containing approximately 5.7–7.4 hours of analyzable NREM EEG per recording.
 
-## Final training protocol
-
-The proposed model and all five baseline training scripts use the same final experimental configuration where applicable:
-
-- patient-grouped five-fold `GroupKFold` with random seed 42;
-- 16 channels sampled at 500 Hz;
-- model input windows of 0.2 seconds;
-- batch size 64, 50 epochs, learning rate `1e-4`, and weight decay `1e-4`;
-- focal loss with alpha 0.65 and gamma 2.0;
-- early stopping with patience 5 and minimum delta 0.003; and
-- final AUG06 positive-sample augmentation.
-
-For AUG06, each positive window in the training fold receives one additional copy. The copy first receives zero-mean Gaussian noise with a standard deviation equal to 3% of the original window standard deviation and is then reversed along the true time axis. Validation and held-out prediction windows are not augmented.
-
 ## Repository structure
 
 ```text
@@ -70,13 +56,13 @@ SELECTS-SpikeNet/
 │       ├── utils/                          # EEG and result-file I/O
 │       └── visualization/                  # Spatial-distribution visualization
 ├── Train model/
-│   ├── config/config.yaml                  # Final LR34-SK/AUG06 configuration
+│   ├── config/config.yaml                  # Proposed-model training configuration
 │   ├── Requirements.txt
 │   └── src/
 │       ├── train.py                        # Proposed-model cross-validation
 │       ├── recompute_patient_swi_tables.py # Final patient-level SWI/SWIAE
 │       ├── models/                         # LR34, SPP, KAN, and fusion model
-│       └── utils/                          # AUG06, preprocessing, and metrics
+│       └── utils/                          # Augmentation, preprocessing, and metrics
 ├── final_baselines/
 │   ├── EEGNet/train.py
 │   ├── EEGNeX/train.py
@@ -174,7 +160,6 @@ interface/code/fold_3_best_weights.pth
 ```
 
 - Model: LightResNet34 + SPP + KAN (LR34-SK)
-- Designated training protocol: AUG06
 - SHA-256: `C097AD93595246434172342223AC2469496DDD2B18E3C5DB757305156AD04595`
 
 The interface loads this checkpoint locally; it does not download or substitute a different model.
@@ -195,7 +180,7 @@ The cache metadata must include `patient_id` so that cross-validation remains pa
 
 Standalone training scripts are provided for EEGNet, EEGNeX, EEGFormer, EEGPT, and LaBraM.
 
-They retain their model-specific architectures and input adapters while sharing the final patient split, AUG06 augmentation, optimizer, training budget, focal loss, and evaluation settings with the proposed model where applicable. EEGPT and LaBraM require their official upstream repositories and pretrained checkpoints.
+They retain their model-specific architectures and input adapters while using the same experimental settings as the proposed model where applicable. EEGPT and LaBraM require their official upstream repositories and pretrained checkpoints.
 
 See [`final_baselines/README.md`](final_baselines/README.md) for setup and checkpoint links. The scripts generate their own fold checkpoints and held-out prediction tables; trained SOTA weights are not distributed in this repository.
 

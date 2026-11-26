@@ -21,8 +21,8 @@ or execution metadata. Runtime paths can be set with `SELECTS_DATA_DIR`,
 ## Shared experiment configuration
 
 Only the model architecture and the model-specific input adapter differ between
-baselines. All five scripts use the same final AUG06 experiment configuration as
-the proposed model:
+baselines. All five scripts use the same experiment configuration as the
+proposed model:
 
 - patient-grouped 5-fold `GroupKFold`, seed 42;
 - 16-channel, 500 Hz, 0.2-second windows;

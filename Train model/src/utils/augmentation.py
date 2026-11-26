@@ -1,4 +1,4 @@
-"""Data augmentation used by the final AUG06 training protocol."""
+"""Data augmentation used by the final training protocol."""
 import numpy as np
 
 

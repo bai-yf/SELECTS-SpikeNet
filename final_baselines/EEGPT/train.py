@@ -154,12 +154,12 @@ def time_reverse(seg):
 
 
 def noise_time_reverse(seg, std_ratio=0.03):
-    """AUG06：先加 3% 高斯噪声，再始终沿真实时间轴反转。"""
+    """先加 3% 高斯噪声，再始终沿真实时间轴反转。"""
     return time_reverse(add_gaussian_noise(seg, std_ratio=std_ratio))
 
 
 def augment(seg, config):
-    """Apply the configured AUG06 transform to one positive training window."""
+    """Apply the configured transform to one positive training window."""
     strategy = config['augmentation_strategy']
     if strategy == 'none':
         return np.asarray(seg).copy()

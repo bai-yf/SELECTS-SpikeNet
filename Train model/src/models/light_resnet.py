@@ -33,7 +33,7 @@ class LightResNet34_EEG(nn.Module):
         self.inplanes = 16
         self.in_channels = in_channels
         if pooling != "spp":
-            raise ValueError("The final AUG06 model requires SPP pooling")
+            raise ValueError("The proposed model requires SPP pooling")
         
         # Input layer
         self.conv1 = nn.Conv2d(

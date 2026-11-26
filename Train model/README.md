@@ -8,7 +8,7 @@ Deep learning-based (ResNet+SPP+KAN) automatic detection system for Benign Epile
 3.Spatial Pyramid Pooling: Multi-scale feature aggregation
 4.Classifier: KAN (Kolmogorov-Arnold Network)
 
-## Final Data Augmentation (AUG06)
+## Training Data Augmentation
 Each positive training segment receives one augmented copy. The copy first receives Gaussian noise with a standard deviation equal to 3% of the segment standard deviation, then is always reversed along the true time axis. Frequency-domain perturbation is not part of the final protocol.
 
 ## Project Structure

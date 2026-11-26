@@ -37,7 +37,7 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     
-    # 2. Load the preprocessed window cache used by the AUG06 workflow.
+    # 2. Load the preprocessed window cache used by the training workflow.
     print("\n" + "="*50)
     print("1. Loading EEG windows")
     print("="*50)
