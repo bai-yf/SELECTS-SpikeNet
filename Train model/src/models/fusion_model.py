@@ -2,7 +2,7 @@
 Fusion Model: LightResNet + KAN Classifier
 """
 import torch.nn as nn
-from .light_resnet import LightResNet18_EEG
+from .light_resnet import LightResNet34_EEG
 from .kan_classifier import KANClassifier
 
 class FusionModel(nn.Module):
@@ -12,7 +12,7 @@ class FusionModel(nn.Module):
         super().__init__()
         
         # ResNet feature extractor
-        self.resnet_extractor = LightResNet18_EEG(
+        self.resnet_extractor = LightResNet34_EEG(
             num_channels=num_channels,
             time_steps=time_steps,
             dropout_rate=dropout_rate,

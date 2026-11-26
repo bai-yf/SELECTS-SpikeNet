@@ -16,7 +16,7 @@ The project owner designates the checked-in `fold_3_best_weights.pth` as the fin
 
 - `main.py`: main window, application state, and workflow orchestration
 - `config.py`: repository-relative paths and shared constants
-- `core/models.py`: LightResNet18, SPP, and KAN model definitions
+- `core/models.py`: LightResNet34, SPP, and KAN model definitions
 - `core/features.py`: raw/difference/SNE feature extraction
 - `core/preprocessing.py`: lazy MATLAB Engine lifecycle and EEGLAB preprocessing
 - `core/metrics.py`: SWI and channel-level spatial metrics

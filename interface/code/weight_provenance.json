@@ -5,7 +5,7 @@
     "additive Gaussian noise",
     "50% true time-axis reversal"
   ],
-  "model_architecture": "LightResNet18 + SPP + KAN",
+  "model_architecture": "LightResNet34 + SPP + KAN",
   "size_bytes": 39935594,
   "sha256": "C097AD93595246434172342223AC2469496DDD2B18E3C5DB757305156AD04595",
   "designation_source": "Project owner confirmation",

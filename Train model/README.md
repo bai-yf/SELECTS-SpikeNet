@@ -4,7 +4,7 @@ Deep learning-based (ResNet+SPP+KAN) automatic detection system for Benign Epile
 
 ## Model Architecture
 1.Feature Extraction: Raw signal + first/second order differences + SNE features
-2.Backbone Network: Lightweight ResNet-18
+2.Backbone Network: Lightweight ResNet-34 (`[3, 4, 6, 3]` residual blocks)
 3.Spatial Pyramid Pooling: Multi-scale feature aggregation
 4.Classifier: KAN (Kolmogorov-Arnold Network)
 

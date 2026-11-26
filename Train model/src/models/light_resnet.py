@@ -1,6 +1,4 @@
-"""
-Lightweight ResNet model definition
-"""
+"""Lightweight ResNet-34 model definition used for EEG training."""
 import torch
 import torch.nn as nn
 from torchvision.models.resnet import BasicBlock
@@ -19,7 +17,7 @@ class SpatialPyramidPooling(nn.Module):
             all_features.append(pooled.view(pooled.size(0), -1))
         return torch.cat(all_features, dim=1)
 
-class LightResNet18_EEG(nn.Module):
+class LightResNet34_EEG(nn.Module):
     def __init__(self, num_channels, time_steps, dropout_rate=0.3, spp_output_sizes=[1,2,4]):
         super().__init__()
         self.inplanes = 16
@@ -42,10 +40,10 @@ class LightResNet18_EEG(nn.Module):
         )
         
         # Residual blocks
-        self.layer1 = self._make_layer(BasicBlock, 32, 2, stride=1)
-        self.layer2 = self._make_layer(BasicBlock, 64, 2, stride=(1, 2))
-        self.layer3 = self._make_layer(BasicBlock, 128, 2, stride=(1, 2))
-        self.layer4 = self._make_layer(BasicBlock, 128, 2, stride=1)
+        self.layer1 = self._make_layer(BasicBlock, 32, 3, stride=1)
+        self.layer2 = self._make_layer(BasicBlock, 64, 4, stride=(1, 2))
+        self.layer3 = self._make_layer(BasicBlock, 128, 6, stride=(1, 2))
+        self.layer4 = self._make_layer(BasicBlock, 128, 3, stride=1)
         
         # SPP
         self.spp = SpatialPyramidPooling(output_sizes=spp_output_sizes)

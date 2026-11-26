@@ -28,7 +28,7 @@ class SpatialPyramidPooling(nn.Module):
         return torch.cat(all_features, dim=1)
 
 
-class LightResNet18_EEG(nn.Module):
+class LightResNet34_EEG(nn.Module):
     def __init__(self, num_channels, time_steps, dropout_rate=0.3, spp_output_sizes=[1,2,4]):
         super().__init__()
         self.inplanes = 16
@@ -116,7 +116,7 @@ class KANClassifier(nn.Module):
 class FusionModel(nn.Module):
     def __init__(self, num_channels, time_steps, num_classes=2, dropout_rate=0.3):
         super().__init__()
-        self.resnet_extractor = LightResNet18_EEG(
+        self.resnet_extractor = LightResNet34_EEG(
             num_channels=num_channels,
             time_steps=time_steps,
             dropout_rate=dropout_rate
